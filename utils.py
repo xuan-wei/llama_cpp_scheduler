@@ -50,7 +50,7 @@ def find_next_available_port(start_port=8090, max_port=9000):
     raise RuntimeError(f"No available ports in range {start_port}-{max_port}")
 
 def download_model(model_name, download_url, model_base_path):
-    """Download model using axel if it doesn't exist."""
+    """Download model using axel, wget, or curl if it doesn't exist."""
     model_path = Path(model_base_path) / f"{model_name}.gguf"
     if model_path.exists():
         logger.info(f"Model {model_name} already exists at {model_path}")
@@ -61,21 +61,47 @@ def download_model(model_name, download_url, model_base_path):
         logger.warning(f"No download URL provided for model {model_name}, skipping download")
         return False
 
+    temp_path = Path(model_base_path) / f"{model_name}.gguf.downloading"
+    logger.info(f"Downloading model {model_name} from {download_url}")
+    
+    # Try different download methods in order of preference
+    download_methods = [
+        {
+            "name": "axel",
+            "check_cmd": ["axel", "--version"],
+            "download_cmd": ["axel", "-n", "16", "-o", str(temp_path), download_url]
+        },
+        {
+            "name": "wget",
+            "check_cmd": ["wget", "--version"],
+            "download_cmd": ["wget", "--progress=bar:force", "-O", str(temp_path), download_url]
+        },
+        {
+            "name": "curl",
+            "check_cmd": ["curl", "--version"],
+            "download_cmd": ["curl", "-L", "-o", str(temp_path), download_url, "--progress-bar"]
+        }
+    ]
+    
+    # Find the first available download method
+    download_method = None
+    for method in download_methods:
+        try:
+            subprocess.run(method["check_cmd"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            download_method = method
+            logger.info(f"Using {method['name']} for downloading")
+            break
+        except (subprocess.SubprocessError, FileNotFoundError):
+            continue
+    
+    if not download_method:
+        logger.error("No download method available. Please install axel, wget, or curl.")
+        return False
+    
     try:
-        temp_path = Path(model_base_path) / f"{model_name}.gguf.downloading"
-        logger.info(f"Downloading model {model_name} from {download_url}")
-        
-        # Use axel with 16 connections for downloading
-        cmd = [
-            "axel",
-            "-n", "16",  # number of connections
-            "-o", str(temp_path),  # output file
-            download_url
-        ]
-        
-        # Run axel and capture output
+        # Run the download command and capture output
         process = subprocess.Popen(
-            cmd,
+            download_method["download_cmd"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             universal_newlines=True
@@ -87,15 +113,30 @@ def download_model(model_name, download_url, model_base_path):
             output = process.stdout.readline()
             if output == '' and process.poll() is not None:
                 break
-            if output and '[' in output and '%]' in output:
-                try:
-                    current = int(output[output.find('[')+1:output.find('%')])
-                    if current != last_percentage:  # Avoid duplicate percentages
-                        speed = output.split('[')[-1].split('KB/s')[0].strip()
-                        print(f"\rDownloading {model_name}: {current}% [{speed}KB/s]", end='', flush=True)
-                        last_percentage = current
-                except (ValueError, IndexError):
-                    pass
+                
+            if output:
+                # Different progress parsing for different tools
+                if download_method["name"] == "axel" and '[' in output and '%]' in output:
+                    try:
+                        current = int(output[output.find('[')+1:output.find('%')])
+                        if current != last_percentage:  # Avoid duplicate percentages
+                            speed = output.split('[')[-1].split('KB/s')[0].strip()
+                            print(f"\rDownloading {model_name}: {current}% [{speed}KB/s]", end='', flush=True)
+                            last_percentage = current
+                    except (ValueError, IndexError):
+                        pass
+                elif download_method["name"] == "wget" and "%" in output:
+                    try:
+                        # Parse wget output like "45% [=======>      ] 123.45K/s eta 1m"
+                        current = int(output.split('%')[0].strip())
+                        if current != last_percentage:
+                            print(f"\rDownloading {model_name}: {current}%", end='', flush=True)
+                            last_percentage = current
+                    except (ValueError, IndexError):
+                        pass
+                elif download_method["name"] == "curl":
+                    # curl with --progress-bar shows a progress bar, just print the output
+                    print(f"\r{output}", end='', flush=True)
 
         print()  # Print newline after download completes
         process.wait()  # Wait for the process to complete
@@ -112,11 +153,6 @@ def download_model(model_name, download_url, model_base_path):
                 temp_path.unlink()  # Clean up failed download
             return False
 
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Error executing axel for {model_name}: {str(e)}")
-        if temp_path.exists():
-            temp_path.unlink()
-        return False
     except Exception as e:
         logger.error(f"Unexpected error downloading model {model_name}: {str(e)}")
         if temp_path.exists():

@@ -10,6 +10,8 @@ import yaml
 from utils import (get_best_gpu, find_next_available_port, ensure_models_exist, 
                    is_container_running, get_container, setup_logger)
 from pathlib import Path
+from collections import defaultdict, deque
+from datetime import datetime, timedelta
 
 logger = setup_logger('scheduler')
 
@@ -54,6 +56,10 @@ container_locks_lock = Lock()  # Meta-lock to protect the container_locks dictio
 # Initialize last request time for all models
 for model_name in model_configs:
     model_last_request[model_name] = time.time()
+
+# Statistics tracking
+model_stats = {}
+model_stats_lock = Lock()
 
 def get_container_lock(container_name):
     """Get or create a lock for a specific container."""
@@ -226,6 +232,7 @@ def forward_request(url, data):
 @app.route('/v1/chat/completions', methods=['POST'])
 def handle_chat_completion():
     """Handle OpenAI chat completions endpoint."""
+    start_time = time.time()
     logger.info(f"Received request from IP: {request.remote_addr} - /v1/chat/completions")
     data = request.json
     if not data:
@@ -238,12 +245,16 @@ def handle_chat_completion():
     if model_name not in model_configs:
         return jsonify({"error": f"Model {model_name} not found"}), 404
 
+    # Initialize stats for this model if not already done
+    init_model_stats(model_name)
+
     # Check if model file exists
     model_path = Path(MODEL_BASE_PATH) / f"{model_name}.gguf"
     if not model_path.exists():
         # Only download if model doesn't exist
         model_config = config['models'][model_name]
         if not ensure_models_exist({model_name: model_config}, MODEL_BASE_PATH):
+            update_model_stats(model_name, time.time() - start_time, success=False)
             return jsonify({"error": f"Failed to download model {model_name}"}), 500
 
     # Get the container lock to synchronize container operations
@@ -257,6 +268,7 @@ def handle_chat_completion():
             logger.info(f"Container for {model_name} is not running, attempting to start it")
             is_success = start_container(model_name)
             if not is_success:
+                update_model_stats(model_name, time.time() - start_time, success=False)
                 return jsonify({"error": f"Failed to start container for {model_name}"}), 500
             
     # Update last request time
@@ -266,76 +278,14 @@ def handle_chat_completion():
     port = model_configs[model_name]["port"]
     url = f'http://localhost:{port}/v1/chat/completions'
     try:
-        return forward_request(url, data)
+        response, status_code = forward_request(url, data)
+        # Update stats with response time
+        update_model_stats(model_name, time.time() - start_time, success=(status_code == 200))
+        return response, status_code
     except Exception as e:
         logger.error(f"Error forwarding request to {model_name}: {str(e)}")
+        update_model_stats(model_name, time.time() - start_time, success=False)
         return jsonify({"error": f"Error communicating with model server: {str(e)}"}), 500
-
-@app.route('/admin/start', methods=['POST'])
-def admin_start_container():
-    """Admin endpoint to manually start a container."""
-    data = request.json
-    if not data:
-        return jsonify({"error": "No JSON data provided"}), 400
-    
-    model_name = data.get('model')
-    if not model_name:
-        return jsonify({"error": "Model name not specified"}), 400
-    
-    if model_name not in model_configs:
-        return jsonify({"error": f"Model {model_name} not found"}), 404
-    
-    container_name = model_configs[model_name]["container_name"]
-    
-    # Get the container lock
-    container_lock = get_container_lock(container_name)
-    
-    # Use the lock to ensure only one thread can start the container
-    with container_lock:
-        # Stop the container first if it's already running
-        if is_container_running(container_name, docker_client):
-            logger.info(f"Container {container_name} is already running, stopping it first to apply new settings")
-            stop_container(model_name)
-        
-        is_success = start_container(model_name)
-        if not is_success:
-            return jsonify({"error": f"Failed to start container for {model_name}"}), 500
-        
-        # Wait for container to be ready
-        is_ready = wait_for_container_ready(model_name)
-        if not is_ready:
-            return jsonify({"error": f"Container for {model_name} failed to start properly"}), 500
-    
-    return jsonify({
-        "message": f"Container for {model_name} started successfully",
-        "port": model_configs[model_name]["port"],
-        "device_id": model_configs[model_name]["device_id"]
-    }), 200
-
-@app.route('/admin/stop', methods=['POST'])
-def admin_stop_container():
-    """Admin endpoint to manually stop a container."""
-    data = request.json
-    if not data:
-        return jsonify({"error": "No JSON data provided"}), 400
-    
-    model_name = data.get('model')
-    if not model_name:
-        return jsonify({"error": "Model name not specified"}), 400
-    
-    if model_name not in model_configs:
-        return jsonify({"error": f"Model {model_name} not found"}), 404
-    
-    is_success = stop_container(model_name)
-    if not is_success:
-        return jsonify({"error": f"Failed to stop container for {model_name}"}), 500
-    
-    # Remove from last request time tracking
-    with model_lock:
-        if model_name in model_last_request:
-            del model_last_request[model_name]
-    
-    return jsonify({"message": f"Container for {model_name} stopped successfully"}), 200
 
 def monitor_inactivity():
     """Monitor for inactivity and stop containers that have been idle too long."""
@@ -405,6 +355,257 @@ def signal_handler(sig, frame):
     stop_all_containers()
     logger.info("All containers stopped, exiting...")
     sys.exit(0)
+
+def init_model_stats(model_name):
+    """Initialize statistics tracking for a model."""
+    with model_stats_lock:
+        if model_name not in model_stats:
+            model_stats[model_name] = {
+                "total_requests": 0,
+                "successful_requests": 0,
+                "response_times": deque(maxlen=100),  # Keep last 100 response times
+                "request_timestamps": deque(maxlen=1000),  # Keep last 1000 request timestamps
+                "downloaded": Path(MODEL_BASE_PATH) / f"{model_name}.gguf" in Path(MODEL_BASE_PATH).glob("*.gguf")
+            }
+
+def update_model_stats(model_name, response_time, success=True):
+    """Update statistics for a model after a request."""
+    with model_stats_lock:
+        if model_name not in model_stats:
+            init_model_stats(model_name)
+        
+        stats = model_stats[model_name]
+        stats["total_requests"] += 1
+        if success:
+            stats["successful_requests"] += 1
+            stats["response_times"].append(response_time)
+        
+        stats["request_timestamps"].append(time.time())
+        
+        # Update downloaded status
+        stats["downloaded"] = Path(MODEL_BASE_PATH) / f"{model_name}.gguf" in Path(MODEL_BASE_PATH).glob("*.gguf")
+
+def get_requests_per_minute(model_name):
+    """Calculate requests per minute for a model."""
+    with model_stats_lock:
+        if model_name not in model_stats:
+            return 0
+        
+        timestamps = model_stats[model_name]["request_timestamps"]
+        if not timestamps:
+            return 0
+        
+        # Count requests in the last minute
+        now = time.time()
+        one_minute_ago = now - 60
+        recent_requests = sum(1 for ts in timestamps if ts > one_minute_ago)
+        return recent_requests
+
+def get_avg_response_time(model_name):
+    """Calculate average response time for a model."""
+    with model_stats_lock:
+        if model_name not in model_stats:
+            return 0
+        
+        response_times = model_stats[model_name]["response_times"]
+        if not response_times:
+            return 0
+        
+        return sum(response_times) / len(response_times)
+
+@app.route('/dashboard', methods=['GET'])
+def dashboard():
+    """Combined dashboard showing both available and running models."""
+    # Get available models
+    available_models = []
+    for model_name in model_configs:
+        init_model_stats(model_name)
+    
+    with model_stats_lock:
+        for model_name, model_config in model_configs.items():
+            downloaded = model_stats[model_name]["downloaded"]
+            available_models.append({
+                "name": model_name,
+                "downloaded": downloaded,
+                "container_name": model_config["container_name"],
+                "download_url": config['models'][model_name].get("download_url", "")
+            })
+    
+    # Get running models
+    running_models = []
+    for model_name, model_config in model_configs.items():
+        container_name = model_config["container_name"]
+        
+        # Check if container is running
+        is_running = is_container_running(container_name, docker_client)
+        
+        if is_running:
+            # Get statistics
+            with model_stats_lock:
+                if model_name not in model_stats:
+                    init_model_stats(model_name)
+                
+                stats = model_stats[model_name]
+                total_requests = stats["total_requests"]
+                successful_requests = stats["successful_requests"]
+                
+            # Calculate derived statistics
+            requests_per_minute = get_requests_per_minute(model_name)
+            avg_response_time = get_avg_response_time(model_name)
+            
+            running_models.append({
+                "name": model_name,
+                "container_name": container_name,
+                "port": model_config["port"],
+                "device_id": model_config["device_id"],
+                "total_requests": total_requests,
+                "successful_requests": successful_requests,
+                "requests_per_minute": requests_per_minute,
+                "avg_response_time": round(avg_response_time, 3)
+            })
+    
+    # Check if JSON format is requested
+    if request.args.get('format') == 'json':
+        return jsonify({
+            "available_models": available_models,
+            "running_models": running_models
+        }), 200
+    
+    # Generate HTML
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Llama.cpp Scheduler Dashboard</title>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 20px; }
+            h1, h2 { color: #333; }
+            table { border-collapse: collapse; width: 100%; margin-top: 20px; margin-bottom: 40px; }
+            th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #ddd; }
+            th { background-color: #f2f2f2; color: #333; font-weight: bold; }
+            tr:hover { background-color: #f5f5f5; }
+            .status-true { color: green; font-weight: bold; }
+            .status-false { color: red; }
+            .download-link { color: blue; text-decoration: none; }
+            .download-link:hover { text-decoration: underline; }
+            .success-rate { font-weight: bold; }
+            .high-rate { color: green; }
+            .medium-rate { color: orange; }
+            .low-rate { color: red; }
+            .refresh-button { 
+                background-color: #4CAF50; 
+                color: white; 
+                padding: 10px 15px; 
+                border: none; 
+                border-radius: 4px; 
+                cursor: pointer; 
+                margin-top: 20px;
+            }
+            .refresh-button:hover { background-color: #45a049; }
+            .section { margin-bottom: 40px; }
+        </style>
+        <script>
+            function refreshPage() {
+                location.reload();
+            }
+            
+            // Auto refresh every 5 mins 
+            setTimeout(function() {
+                refreshPage();
+            }, 300000);
+        </script>
+    </head>
+    <body>
+        <h1>Llama.cpp Scheduler Dashboard</h1>
+        <button class="refresh-button" onclick="refreshPage()">Refresh</button>
+        <p><small>Page auto-refreshes every 5 mins</small></p>
+        
+        <div class="section">
+            <h2>Running Models</h2>
+    """
+    
+    if running_models:
+        html += """
+            <table>
+                <tr>
+                    <th>Model Name</th>
+                    <th>Port</th>
+                    <th>GPU ID</th>
+                    <th>Total Requests</th>
+                    <th>Success Rate</th>
+                    <th>Requests/Min</th>
+                    <th>Avg Response Time (s)</th>
+                </tr>
+        """
+        
+        for model in running_models:
+            success_rate = 0
+            if model["total_requests"] > 0:
+                success_rate = (model["successful_requests"] / model["total_requests"]) * 100
+            
+            rate_class = "high-rate" if success_rate > 90 else "medium-rate" if success_rate > 70 else "low-rate"
+            
+            html += f"""
+                <tr>
+                    <td>{model["name"]}</td>
+                    <td>{model["port"]}</td>
+                    <td>{model["device_id"]}</td>
+                    <td>{model["total_requests"]}</td>
+                    <td class="success-rate {rate_class}">{success_rate:.1f}%</td>
+                    <td>{model["requests_per_minute"]}</td>
+                    <td>{model["avg_response_time"]} s</td>
+                </tr>
+            """
+        
+        html += """
+            </table>
+        """
+    else:
+        html += """
+            <p>No models are currently running.</p>
+        """
+    
+    html += """
+        </div>
+        
+        <div class="section">
+            <h2>Available Models</h2>
+            <table>
+                <tr>
+                    <th>Model Name</th>
+                    <th>Downloaded</th>
+                    <th>Container Name</th>
+                    <th>Download URL</th>
+                </tr>
+    """
+    
+    for model in available_models:
+        download_status = "Yes" if model["downloaded"] else "No"
+        status_class = "status-true" if model["downloaded"] else "status-false"
+        download_url = model["download_url"] if model["download_url"] else "N/A"
+        
+        if download_url != "N/A":
+            download_url_html = f'<a href="{download_url}" class="download-link" target="_blank">{download_url}</a>'
+        else:
+            download_url_html = "N/A"
+            
+        html += f"""
+            <tr>
+                <td>{model["name"]}</td>
+                <td class="{status_class}">{download_status}</td>
+                <td>{model["container_name"]}</td>
+                <td>{download_url_html}</td>
+            </tr>
+        """
+    
+    html += """
+            </table>
+        </div>
+    </body>
+    </html>
+    """
+    
+    return html
 
 if __name__ == '__main__':
     logger.info("Starting Llama.cpp scheduler")
