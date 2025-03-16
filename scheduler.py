@@ -1,95 +1,47 @@
 import time
-import logging
 from threading import Thread, Lock
-import subprocess
 from flask import Flask, request, jsonify
 import requests
 import json
 import docker
-import socket
-import numpy as np
 import signal
 import sys
+import yaml
+from utils import (get_best_gpu, find_next_available_port, ensure_models_exist, 
+                   is_container_running, get_container, setup_logger)
+from pathlib import Path
 
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger('scheduler')
+logger = setup_logger('scheduler')
 
 app = Flask(__name__)
 
 # Docker client
 docker_client = docker.from_env()  # Run as root
 
-# Configuration
-INACTIVITY_TIMEOUT = 300  # seconds (5 minutes)
-INACTIVITY_CHECK_INTERVAL = 60  # seconds (1 minute)
-CONTAINER_STARTUP_TIMEOUT = 120  # seconds (2 minutes)
-HEALTH_CHECK_INTERVAL = 2  # seconds
-MODEL_INIT_DELAY = 5  # seconds to wait after container starts before checking readiness
+# Load configuration
+with open('config.yaml', 'r') as f:
+    config = yaml.safe_load(f)
 
-FORCE_GPU_ID = None # 0/1/None
+# Update global variables from config
+MODEL_BASE_PATH = config['model_base_path']
+DOCKER_IMAGE = config['docker_image']
+INACTIVITY_TIMEOUT = config['inactivity_timeout']
+INACTIVITY_CHECK_INTERVAL = config['inactivity_check_interval']
+CONTAINER_STARTUP_TIMEOUT = config['container_startup_timeout']
+HEALTH_CHECK_INTERVAL = config['health_check_interval']
+MODEL_INIT_DELAY = config['model_init_delay']
+FORCE_GPU_ID = config['force_gpu_id']
 
-PROXIES_SETTINGS = {
-    "http": None,
-    "https": None
-}
-
-# Base paths for models and configurations
-MODEL_BASE_PATH = "/home/xuan/.cache/llama.cpp"  # Update this to your actual model path
-DOCKER_IMAGE = "ghcr.io/ggml-org/llama.cpp:server-cuda"  # Or your specific image
-
-# Model configuration (context size, GPU layers, device ID, container name, port)
-commen_config = {
-    "ctx_size": 4096, 
-    "n_gpu_layers": 100, 
-    "threads": 20,
-    "parallel": 1,
-    "flash_attn": 1,
-    "cont_batching": 1,
-    "device_id": None, # Will be assigned dynamically if None
-    "port": None,  # Will be assigned dynamically if None
-}
-
-model_configs = {
-    "qwen2.5-14b": {
-        "container_name": "llama.cpp_qwen2.5-14b",
-        **commen_config
-    },
-    "nanbeige-16b": {
-        "container_name": "llama.cpp_nanbeige-16b",
-        **commen_config
-    },
-    "phi4-14b": {
-        "container_name": "llama.cpp_phi4-14b",
-        **commen_config
-    },
-    "qwen2.5-7b": {
-        "container_name": "llama.cpp_qwen2.5-7b",
-        "port": None,  # Will be assigned dynamically if None
-        **commen_config
-    },
-    "qwen2.5-coder-7b": {
-        "container_name": "llama.cpp_qwen2.5-coder-7b",
-        "port": None,  # Will be assigned dynamically if None
-        **commen_config
-    },
-    "deepseek-coder-6.7b": {
-        "container_name": "llama.cpp_deepseek-coder-6.7b",
-        **commen_config
-    },
-    "glm4": {
-        "container_name": "llama.cpp_glm4",
-        **commen_config
-    },
-    "llama3.1-8b": {
-        "container_name": "llama.cpp_llama3.1-8b",
-        **commen_config
+# Initialize model configurations from config file
+model_configs = {}
+for model_name, model_config in config['models'].items():
+    container_name = model_config["container_name"]
+    container_name = container_name.replace("llama.cpp_", "llama.cpp_scheduler_")
+    model_configs[model_name] = {
+        **config['common_config'],
+        **model_config,
+        "container_name": container_name
     }
-}
 
 # Dictionary to track the last request time for each model
 model_last_request = {}
@@ -110,59 +62,6 @@ def get_container_lock(container_name):
             container_locks[container_name] = Lock()
         return container_locks[container_name]
 
-def is_container_running(container_name):
-    """Check if a container is running using Docker SDK."""
-    try:
-        # Only get running containers
-        containers = docker_client.containers.list(filters={"name": container_name}, all=False)
-        return len(containers) > 0
-    except docker.errors.APIError as e:
-        logger.error(f"Error checking if container {container_name} is running: {str(e)}")
-        return False
-
-def get_container(container_name, all=True):
-    """Get a container by name, including stopped containers if all=True."""
-    try:
-        containers = docker_client.containers.list(filters={"name": container_name}, all=all)
-        return containers[0] if containers else None
-    except docker.errors.APIError as e:
-        logger.error(f"Error getting container {container_name}: {str(e)}")
-        return None
-
-def get_best_gpu():
-    """
-    Returns the ID of the GPU with the most available memory using nvidia-smi.
-    """
-    if FORCE_GPU_ID is not None:
-        return FORCE_GPU_ID
-        
-    try:
-        # Run nvidia-smi to get memory info
-        output = subprocess.check_output(['nvidia-smi', '--query-gpu=memory.free', '--format=csv,nounits,noheader'])
-        memory_free_list = [int(x) for x in output.decode('utf-8').strip().split('\n')]
-        
-        if not memory_free_list:
-            return 0  # Default to GPU 0 if no info available
-            
-        return memory_free_list.index(max(memory_free_list))
-        
-    except (subprocess.CalledProcessError, ValueError, FileNotFoundError):
-        return 0  # Default to GPU 0 if command fails
-
-def find_next_available_port(start_port=8090, max_port=9000):
-    """Find the next available port starting from start_port."""
-    for port in range(start_port, max_port + 1):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            # Setting a timeout to speed up the check
-            sock.settimeout(0.1)
-            # If we can't connect to the port, it's available
-            result = sock.connect_ex(('127.0.0.1', port))
-            if result != 0:  # Port is available
-                return port
-    # If no ports are available in the range
-    raise RuntimeError(f"No available ports in range {start_port}-{max_port}")
-
-
 def start_container(model_name):
     """Start a Docker container with the specified parameters using Docker SDK."""
     if model_name not in model_configs:
@@ -174,12 +73,12 @@ def start_container(model_name):
     
     try:
         # Check if container is already running
-        if is_container_running(container_name):
+        if is_container_running(container_name, docker_client):
             logger.info(f"Container {container_name} is already running")
             return True
         
         # Check if container exists but is stopped
-        existing_container = get_container(container_name)
+        existing_container = get_container(container_name, docker_client)
         if existing_container:
             logger.info(f"Found existing container {container_name} in state: {existing_container.status}")
             try:
@@ -191,7 +90,7 @@ def start_container(model_name):
                 return False
         
         # Get the best GPU to use
-        config["device_id"] = get_best_gpu()
+        config["device_id"] = get_best_gpu(FORCE_GPU_ID)
         logger.info(f"Selected GPU {config['device_id']} for model {model_name}")
         
         # If no port is assigned, find the next available one
@@ -269,7 +168,7 @@ def stop_container(model_name):
     with container_lock:
         try:
             # Find the container
-            container = get_container(container_name)
+            container = get_container(container_name, docker_client)
             
             if not container:
                 logger.info(f"Container {container_name} is not running")
@@ -295,7 +194,7 @@ def stop_all_containers():
     
     for model_name, config in model_configs.items():
         container_name = config["container_name"]
-        if is_container_running(container_name):
+        if is_container_running(container_name, docker_client):
             logger.info(f"Stopping container {container_name} for model {model_name}")
             if stop_container(model_name):
                 logger.info(f"Successfully stopped container {container_name}")
@@ -313,7 +212,8 @@ def update_last_request_time(model_name):
 def forward_request(url, data):
     """Forward the request to the specified URL."""
     try:
-        response = requests.post(url, json=data, timeout=120, proxies=PROXIES_SETTINGS)  # 2-minute timeout
+        proxies = config.get('proxies', {"http": None, "https": None})
+        response = requests.post(url, json=data, timeout=120, proxies=proxies)  # 2-minute timeout
         return jsonify(response.json()), response.status_code
     except requests.exceptions.Timeout:
         return jsonify({"error": "Request to model timed out"}), 504
@@ -338,6 +238,14 @@ def handle_chat_completion():
     if model_name not in model_configs:
         return jsonify({"error": f"Model {model_name} not found"}), 404
 
+    # Check if model file exists
+    model_path = Path(MODEL_BASE_PATH) / f"{model_name}.gguf"
+    if not model_path.exists():
+        # Only download if model doesn't exist
+        model_config = config['models'][model_name]
+        if not ensure_models_exist({model_name: model_config}, MODEL_BASE_PATH):
+            return jsonify({"error": f"Failed to download model {model_name}"}), 500
+
     # Get the container lock to synchronize container operations
     container_name = model_configs[model_name]["container_name"]
     container_lock = get_container_lock(container_name)
@@ -345,7 +253,7 @@ def handle_chat_completion():
     # Use the lock to ensure only one thread can check/start the container
     with container_lock:
         # Check if container is running by checking if it's ready
-        if not is_container_running(container_name):
+        if not is_container_running(container_name, docker_client):
             logger.info(f"Container for {model_name} is not running, attempting to start it")
             is_success = start_container(model_name)
             if not is_success:
@@ -385,7 +293,7 @@ def admin_start_container():
     # Use the lock to ensure only one thread can start the container
     with container_lock:
         # Stop the container first if it's already running
-        if is_container_running(container_name):
+        if is_container_running(container_name, docker_client):
             logger.info(f"Container {container_name} is already running, stopping it first to apply new settings")
             stop_container(model_name)
         
@@ -441,7 +349,7 @@ def monitor_inactivity():
                 if current_time - last_time > INACTIVITY_TIMEOUT:
                     if model_name in model_configs:
                         container_name = model_configs[model_name]["container_name"]
-                        if is_container_running(container_name):
+                        if is_container_running(container_name, docker_client):
                             logger.info(f"Container {container_name} has been idle for {current_time - last_time:.1f} seconds, stopping")
                             stop_container(model_name)
                             del model_last_request[model_name]
@@ -458,7 +366,7 @@ def wait_for_container_ready(model_name, timeout=CONTAINER_STARTUP_TIMEOUT):
     
     start_time = time.time()
     while time.time() - start_time < timeout:
-        if is_container_running(model_name):
+        if is_container_running(model_name, docker_client):
             logger.info(f"Container for {model_name} is ready")
             return True
         
@@ -468,7 +376,7 @@ def wait_for_container_ready(model_name, timeout=CONTAINER_STARTUP_TIMEOUT):
             # Check container logs to see if there are any issues
             try:
                 container_name = model_configs[model_name]["container_name"]
-                container = get_container(container_name, all=False)
+                container = get_container(container_name, docker_client, all=False)
                 if container:
                     logs = container.logs(tail=10).decode('utf-8', errors='replace')
                     logger.info(f"Waiting for {model_name} to be ready... ({elapsed:.1f}s elapsed)")
@@ -481,7 +389,7 @@ def wait_for_container_ready(model_name, timeout=CONTAINER_STARTUP_TIMEOUT):
     # If we timed out, get the container logs to help diagnose the issue
     try:
         container_name = model_configs[model_name]["container_name"]
-        container = get_container(container_name, all=False)
+        container = get_container(container_name, docker_client, all=False)
         if container:
             logs = container.logs(tail=50).decode('utf-8', errors='replace')
             logger.error(f"Container logs for {model_name} after timeout: {logs}")

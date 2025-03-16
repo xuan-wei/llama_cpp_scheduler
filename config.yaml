@@ -1,0 +1,63 @@
+# Base paths and settings
+model_base_path: "/home/xuan/.cache/llama.cpp"
+docker_image: "ghcr.io/ggml-org/llama.cpp:server-cuda"
+
+# Timeouts and intervals
+inactivity_timeout: 300  # seconds (5 minutes)
+inactivity_check_interval: 60  # seconds (1 minute)
+container_startup_timeout: 120  # seconds (2 minutes)
+health_check_interval: 2  # seconds
+model_init_delay: 5  # seconds
+
+# GPU settings
+force_gpu_id: null  # 0/1/null
+
+# Common model configuration
+common_config:
+  ctx_size: 4096
+  n_gpu_layers: 100
+  threads: 20
+  parallel: 1
+  flash_attn: 1
+  cont_batching: 1
+  device_id: null  # Will be assigned dynamically
+  port: null  # Will be assigned dynamically
+
+# Model specific configurations
+models:
+  qwen2.5-14b:
+    download_url: "https://modelscope.cn/models/Qwen/Qwen2.5-14B-Instruct-GGUF/resolve/master/qwen2.5-14b-instruct-q4_k_m.gguf"
+    container_name: "llama.cpp_qwen2.5-14b"
+
+  nanbeige-16b:
+    download_url: ""
+    container_name: "llama.cpp_nanbeige-16b"
+
+  phi4-14b:
+    download_url: ""
+    container_name: "llama.cpp_phi4-14b"
+
+  qwen2.5-7b:
+    download_url: ""
+    container_name: "llama.cpp_qwen2.5-7b"
+
+  qwen2.5-coder-7b:
+    download_url: ""
+    container_name: "llama.cpp_qwen2.5-coder-7b"
+
+  deepseek-coder-6.7b:
+    download_url: ""
+    container_name: "llama.cpp_deepseek-coder-6.7b"
+
+  glm4:
+    download_url: ""
+    container_name: "llama.cpp_glm4"
+
+  llama3.1-8b:
+    download_url: ""
+    container_name: "llama.cpp_llama3.1-8b"
+
+# Add this to your existing config.yaml
+proxies:
+  http: null
+  https: null 
