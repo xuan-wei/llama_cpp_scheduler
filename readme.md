@@ -1,5 +1,3 @@
-
-
 # Llama.cpp Scheduler
 
 A dynamic scheduler for managing multiple Llama.cpp model instances in Docker containers. A lightweight alternative to Ollama.
@@ -15,7 +13,7 @@ While Ollama provides a user-friendly interface for running LLMs, I met a signif
 - **Container Lifecycle Management**: Automatically starts and stops containers as needed
 - **Inactivity Monitoring**: Shuts down idle containers to free up resources
 - **Web Dashboard**: Monitor running models and their statistics
-- **OpenAI-compatible API**: Drop-in replacement for OpenAI's chat completions API
+- **OpenAI-compatible API**: Drop-in replacement for OpenAI's chat completions API (embedding API not supported yet)
 
 ## Requirements
 
@@ -37,7 +35,7 @@ While Ollama provides a user-friendly interface for running LLMs, I met a signif
    pip install -r requirements.txt
    ```
 
-3. Configure your models in `config.yaml`. You need to find the download url for the model you want to use from the model providers such as huggingface, modelscope, etc. The gguf file should be in a single file.
+3. Configure your models in `config.yaml`. You need to find the download url for the model you want to use from the model providers such as huggingface, modelscope, etc. The gguf file should be in a single file. Also, remember to set chat-template for each model.
 
 ## Usage
 

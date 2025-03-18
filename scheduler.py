@@ -1,6 +1,6 @@
 import time
 from threading import Thread, Lock
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 import requests
 import json
 import docker
@@ -33,12 +33,14 @@ CONTAINER_STARTUP_TIMEOUT = config['container_startup_timeout']
 HEALTH_CHECK_INTERVAL = config['health_check_interval']
 MODEL_INIT_DELAY = config['model_init_delay']
 FORCE_GPU_ID = config['force_gpu_id']
+REQUEST_TIMEOUT = config['request_timeout']
 
+docker_name_prefix = config['docker_name_prefix']
 # Initialize model configurations from config file
 model_configs = {}
 for model_name, model_config in config['models'].items():
     container_name = model_config["container_name"]
-    container_name = container_name.replace("llama.cpp_", "llama.cpp_scheduler_")
+    container_name = docker_name_prefix + "_" + container_name
     model_configs[model_name] = {
         **config['common_config'],
         **model_config,
@@ -68,7 +70,7 @@ def get_container_lock(container_name):
             container_locks[container_name] = Lock()
         return container_locks[container_name]
 
-def start_container(model_name):
+def start_container(model_name, service_type):
     """Start a Docker container with the specified parameters using Docker SDK."""
     if model_name not in model_configs:
         logger.error(f"Model {model_name} not found in configuration")
@@ -113,23 +115,36 @@ def start_container(model_name):
                 
         # Prepare command
         command = [
-            "-m", f"/models/{model_name}.gguf",
-            "-c", str(config["ctx_size"]),
+            "--model", f"/models/{model_name}.gguf",
+            "--ctx-size", str(config["ctx_size"]),
             "--n-gpu-layers", str(config["n_gpu_layers"]),
             "--host", "0.0.0.0",
             "--port", str(config["port"]),
             "--threads", str(config["threads"]),
             "--parallel", str(config["parallel"]),
-            "--cont-batching",
-            "--flash-attn",
-
         ]
+        if config["cont_batching"]:
+            command.extend(["--cont-batching"])
+        if config["flash_attn"]:
+            command.extend(["--flash-attn"])
 
+        if service_type == 'chat':          
+            command.extend(["--predict", str(config["predict"])])
+            if config.get("chat_template"):
+                command.extend(["--chat-template", config["chat_template"]])
+
+        if service_type == 'embedding':          
+            # Add embedding-specific parameters
+            command.extend(["--embedding",
+                            "--batch-size", str(config["batch_size"]),
+                            "--ubatch-size", str(config["ubatch_size"])])
+            
         volumes = {
             MODEL_BASE_PATH: {'bind': '/models', 'mode': 'ro'}
         }
         
-        logger.info(f"Starting container {container_name} with command: {' '.join(command)} --device-id {config['device_id']}")
+        # Log the full command for debugging
+        logger.info(f"Starting container {container_name} on device {config['device_id']} with command: {' '.join(command)}")
         
         # Create and start the container
         container = docker_client.containers.run(
@@ -215,26 +230,38 @@ def update_last_request_time(model_name):
         model_last_request[model_name] = time.time()
         logger.debug(f"Updated last request time for {model_name}")
 
-def forward_request(url, data):
-    """Forward the request to the specified URL."""
+def process_request(url, data):
+    """Stream the request to the specified URL and process the response."""
     try:
         proxies = config.get('proxies', {"http": None, "https": None})
-        response = requests.post(url, json=data, timeout=120, proxies=proxies)  # 2-minute timeout
-        return jsonify(response.json()), response.status_code
+        with requests.post(url, json=data, timeout=REQUEST_TIMEOUT, proxies=proxies, stream=True) as response: 
+            response.raise_for_status()
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    # Process the chunk if needed
+                    # For example, you could decode it or transform it
+                    processed_chunk = process_chunk(chunk)
+                    yield processed_chunk
     except requests.exceptions.Timeout:
-        return jsonify({"error": "Request to model timed out"}), 504
+        yield json.dumps({"error": "Request to model timed out"}).encode('utf-8')
     except requests.exceptions.RequestException as e:
-        return jsonify({"error": f"Error forwarding request: {str(e)}"}), 500
+        yield json.dumps({"error": f"Error forwarding request: {str(e)}"}).encode('utf-8')
     except json.JSONDecodeError:
-        # Handle case where response is not valid JSON
-        return jsonify({"error": "Invalid response from model server"}), 502
+        yield json.dumps({"error": "Invalid response from model server"}).encode('utf-8')
 
-@app.route('/v1/chat/completions', methods=['POST'])
-def handle_chat_completion():
-    """Handle OpenAI chat completions endpoint."""
+def process_chunk(chunk):
+    """Process a chunk of data."""
+    # Example processing: decode the chunk
+    try:
+        return chunk.decode('utf-8')
+    except UnicodeDecodeError:
+        return chunk  # Return raw chunk if decoding fails
+
+def handle_request(data, endpoint, service_type):
+    """Generalized logic for handling requests."""
     start_time = time.time()
-    logger.info(f"Received request from IP: {request.remote_addr} - /v1/chat/completions")
-    data = request.json
+    logger.info(f"Received request from IP: {request.remote_addr} - {endpoint}")
+    
     if not data:
         return jsonify({"error": "No JSON data provided"}), 400
     
@@ -266,7 +293,7 @@ def handle_chat_completion():
         # Check if container is running by checking if it's ready
         if not is_container_running(container_name, docker_client):
             logger.info(f"Container for {model_name} is not running, attempting to start it")
-            is_success = start_container(model_name)
+            is_success = start_container(model_name, service_type)
             if not is_success:
                 update_model_stats(model_name, time.time() - start_time, success=False)
                 return jsonify({"error": f"Failed to start container for {model_name}"}), 500
@@ -274,18 +301,40 @@ def handle_chat_completion():
     # Update last request time
     update_last_request_time(model_name)
     
+    url_to_forward = None
+    if service_type == 'chat':
+        url_to_forward = 'v1/chat/completions'
+    elif service_type == 'embedding':
+        url_to_forward = 'v1/embeddings'
+    else:
+        raise ValueError(f"Invalid service type: {service_type}")
+    
+    # truncate the data
+
     # Forward the request
     port = model_configs[model_name]["port"]
-    url = f'http://localhost:{port}/v1/chat/completions'
+    url = f'http://localhost:{port}/{url_to_forward}'
     try:
-        response, status_code = forward_request(url, data)
-        # Update stats with response time
-        update_model_stats(model_name, time.time() - start_time, success=(status_code == 200))
-        return response, status_code
+        return Response(process_request(url, data), content_type='application/json')
     except Exception as e:
         logger.error(f"Error forwarding request to {model_name}: {str(e)}")
         update_model_stats(model_name, time.time() - start_time, success=False)
         return jsonify({"error": f"Error communicating with model server: {str(e)}"}), 500
+
+@app.route('/v1/chat/completions', methods=['POST'])
+def handle_chat_completion():
+    """Handle OpenAI chat completions endpoint."""
+    return handle_request(request.json, '/v1/chat/completions', 'chat')
+
+@app.route('/api/chat', methods=['POST'])
+def handle_api_chat():
+    """Handle chat requests to the /api/chat endpoint."""
+    return handle_request(request.json, '/api/chat', 'chat')
+
+# @app.route('/v1/embeddings', methods=['POST'])
+# def handle_embeddings():
+#     """Handle requests to the /v1/embeddings endpoint."""
+#     return handle_request(request.json, '/v1/embeddings', 'embedding' )
 
 def monitor_inactivity():
     """Monitor for inactivity and stop containers that have been idle too long."""

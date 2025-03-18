@@ -8,54 +8,88 @@ inactivity_check_interval: 60  # seconds (1 minute)
 container_startup_timeout: 120  # seconds (2 minutes)
 health_check_interval: 2  # seconds
 model_init_delay: 5  # seconds
+request_timeout: 1800  # seconds (30 minutes)
 
 # GPU settings
 force_gpu_id: null  # 0/1/null
 
+# docker name prefix
+docker_name_prefix: "llama.cpp_scheduler"
+
 # Common model configuration
 common_config:
-  ctx_size: 4096
+  # common
   n_gpu_layers: 100
   threads: 20
-  parallel: 1
   flash_attn: 1
   cont_batching: 1
   device_id: null  # Will be assigned dynamically
   port: null  # Will be assigned dynamically
+  ctx_size: 40960
+  parallel: 10
+  # for chat
+  predict: 2048
+  # for embedding (todo, currently not supported)
+  batch_size: 2048
+  ubatch_size: 2048
 
 # Model specific configurations
+# for chat-template, first check ollama, then check Refer to https://github.com/ggml-org/llama.cpp/blob/a53f7f7b8859f3e634415ab03e1e295b9861d7e6/src/llama-chat.cpp
+# also, you might need to check the log of docker images to find whether the chat-template being used is correct.
 models:
   qwen2.5-14b:
     download_url: "https://modelscope.cn/models/Qwen/Qwen2.5-14B-Instruct-GGUF/resolve/master/qwen2.5-14b-instruct-q4_k_m.gguf"
-    container_name: "llama.cpp_qwen2.5-14b"
+    container_name: "qwen2.5-14b"
+    ctx_size: 80920
+    parallel: 20
+    chat_template: "chatml"
 
   nanbeige-16b:
     download_url: ""
-    container_name: "llama.cpp_nanbeige-16b"
+    container_name: "nanbeige-16b"
+    chat_template: "llama3" # refer to https://ollama.com/rouge/nanbeige2-16b-chat/blobs/4ddf52c3a1ac and https://github.com/ggml-org/llama.cpp/wiki/Templates-supported-by-llama_chat_apply_template
 
   phi4-14b:
     download_url: ""
-    container_name: "llama.cpp_phi4-14b"
+    container_name: "phi4-14b"
+    chat_template: "phi4" # this is not provided in the official docs (https://github.com/ggml-org/llama.cpp/blob/master/examples/server/README.md); but it works. Refer to https://github.com/ggml-org/llama.cpp/blob/a53f7f7b8859f3e634415ab03e1e295b9861d7e6/src/llama-chat.cpp
 
   qwen2.5-7b:
     download_url: ""
-    container_name: "llama.cpp_qwen2.5-7b"
+    container_name: "qwen2.5-7b"
+    ctx_size: 80920
+    parallel: 20
+    chat_template: "chatml"
 
   qwen2.5-coder-7b:
     download_url: ""
-    container_name: "llama.cpp_qwen2.5-coder-7b"
+    container_name: "qwen2.5-coder-7b"
+    chat_template: "chatml"
 
   deepseek-coder-6.7b:
     download_url: ""
-    container_name: "llama.cpp_deepseek-coder-6.7b"
+    container_name: "deepseek-coder-6.7b"
+    chat_template: "deepseek"
 
   glm4:
     download_url: ""
-    container_name: "llama.cpp_glm4"
-
+    container_name: "glm4"
+    chat_template: "chatglm4"
+    
   llama3.1-8b:
     download_url: ""
-    container_name: "llama.cpp_llama3.1-8b"
+    container_name: "llama3.1-8b"
+    chat_template: "llama3"
+    
+  # all-minilm:
+  #   download_url: "https://modelscope.cn/models/AI-ModelScope/All-MiniLM-L6-v2-Embedding-GGUF/resolve/master/all-MiniLM-L6-v2-ggml-model-f16.gguf"
+  #   container_name: "all-minilm"
+  #   model_ctx_size: 256
+
+  # nomic-embed-text:
+  #   download_url: "https://modelscope.cn/models/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/master/nomic-embed-text-v1.5.f16.gguf"
+  #   container_name: "nomic-embed-text"
+  #   model_ctx_size: 8192
 
 # Add this to your existing config.yaml
 proxies:
