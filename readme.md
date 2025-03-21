@@ -13,14 +13,17 @@ While Ollama provides a user-friendly interface for running LLMs, I met a signif
 - **Container Lifecycle Management**: Automatically starts and stops containers as needed
 - **Inactivity Monitoring**: Shuts down idle containers to free up resources
 - **Web Dashboard**: Monitor running models and their statistics
-- **OpenAI-compatible API**: Drop-in replacement for OpenAI's chat completions API (embedding API not supported yet)
+- **OpenAI-compatible API**: Drop-in replacement for OpenAI's chat completions and embeddings API
+- **Ollama Models Support**: Can use existing Ollama models repository without re-downloading
+- **Intelligent Token Truncation**: Automatically truncates embedding inputs according to model context size
+- **Robust Health Checking**: Ensures containers are truly ready to accept requests before serving traffic
 
 ## Requirements
 
 - Python 3.8+
 - Docker with NVIDIA Container Toolkit
 - NVIDIA GPU(s) with CUDA support
-- `axel` for parallel downloads (optional but recommended)
+- Ollama models repository (automatically downloaded if not provided)
 
 ## Installation
 
@@ -35,7 +38,14 @@ While Ollama provides a user-friendly interface for running LLMs, I met a signif
    pip install -r requirements.txt
    ```
 
-3. Configure your models in `config.yaml`. You need to find the download url for the model you want to use from the model providers such as huggingface, modelscope, etc. The gguf file should be in a single file. Also, remember to set chat-template for each model.
+3. Configure your models in `config.yaml`. Several key points:
+   - Set the path to your Ollama models repository (necessary if you want to re-use Ollama models)
+   - Set the HF_path to your HuggingFace cache path (necessary if you want to re-use locally downloaded models from HuggingFace)
+   - Set model-specific parameters
+     - **Naming**: Use the Ollama model format: `[namespace/]name[:tag]` (e.g., `qwen2.5:14b`, `llama3:8b`)
+     - **Chat Completion**: Set `ctx_size`, `parallel`, `flash_attn`, `cont_batching`, and `chat_template` properly. For chat completion, check [here](https://github.com/ggml-org/llama.cpp/blob/master/examples/server/README.md) and [here](https://github.com/ggml-org/llama.cpp/wiki/Templates-supported-by-llama_chat_apply_template). 
+     - **Embedding**: Set `model_ctx_size` properly to match the tokenizer's context window. Need to check the official docs of the model you are using (`important and necessary`); Or, the truncation won't work and it will raise error. Note: Embedding models don't benefit much from `parallel`, `flash_attn`, or `cont_batching` settings. Set `parallel` to 1 and turn off `flash_attn` and `cont_batching`.
+
 
 ## Usage
 
@@ -51,29 +61,31 @@ While Ollama provides a user-friendly interface for running LLMs, I met a signif
 
 3. Send requests to the API:
    ```bash
+   # Chat completions example
    curl http://localhost:5000/v1/chat/completions \
      -H "Content-Type: application/json" \
      -d '{
-       "model": "qwen2.5-14b",
+       "model": "qwen2.5:14b",
        "messages": [{"role": "user", "content": "Hello, how are you?"}],
        "temperature": 0.7
+     }'
+     
+   # Embeddings example
+   curl http://localhost:5000/v1/embeddings \
+     -H "Content-Type: application/json" \
+     -d '{
+       "model": "all-minilm:latest",
+       "input": "Hello, I would like to get the embedding for this text"
      }'
    ```
 
 ## API Endpoints
 
 - **`/v1/chat/completions`**: OpenAI-compatible chat completions API
-- other openai compatible endpoints to be added soon
+- **`/api/chat`**: OpenAI-compatible chat completions API
+- **`/v1/embeddings`**: OpenAI-compatible embeddings API
+- **`/api/embed`**: OpenAI-compatible embeddings API
 - **`/dashboard`**: Web dashboard showing available and running models
-
-
-## How It Works
-
-1. When a request is received, the scheduler checks if the requested model is downloaded
-2. If not downloaded, it downloads the model from the configured URL
-3. The scheduler then starts a Docker container for the model if not already running
-4. The request is forwarded to the container
-5. The container is automatically stopped after a period of inactivity
 
 ## License
 

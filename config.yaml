@@ -1,13 +1,18 @@
+debug: true
+host: "0.0.0.0"
+port: 5000
+
 # Base paths and settings
-model_base_path: "/home/xuan/.cache/llama.cpp"
-docker_image: "ghcr.io/ggml-org/llama.cpp:server-cuda"
+ollama_path: "/data/shared/ollama_model"  # Path to Ollama repository
+HF_path: "/home/xuan/cache/huggingface/hub" # Path to HuggingFace cache
+HF_MIRROR: "https://hf-mirror.com" # HuggingFace mirror
+docker_image: "ghcr.io/ggml-org/llama.cpp:server-cuda" # Docker image
 
 # Timeouts and intervals
 inactivity_timeout: 300  # seconds (5 minutes)
 inactivity_check_interval: 60  # seconds (1 minute)
-container_startup_timeout: 120  # seconds (2 minutes)
+container_startup_timeout: 60  # seconds (1 minutes)
 health_check_interval: 2  # seconds
-model_init_delay: 5  # seconds
 request_timeout: 1800  # seconds (30 minutes)
 
 # GPU settings
@@ -18,78 +23,101 @@ docker_name_prefix: "llama.cpp_scheduler"
 
 # Common model configuration
 common_config:
-  # common
+  # common for all models
   n_gpu_layers: 100
-  threads: 20
-  flash_attn: 1
-  cont_batching: 1
+  threads: 76 # value copied from ollama
   device_id: null  # Will be assigned dynamically
   port: null  # Will be assigned dynamically
-  ctx_size: 40960
-  parallel: 10
-  # for chat
-  predict: 2048
-  # for embedding (todo, currently not supported)
-  batch_size: 2048
-  ubatch_size: 2048
+  # for chat completion
+  predict: 2048 # default predict length
 
 # Model specific configurations
-# for chat-template, first check ollama, then check Refer to https://github.com/ggml-org/llama.cpp/blob/a53f7f7b8859f3e634415ab03e1e295b9861d7e6/src/llama-chat.cpp
-# also, you might need to check the log of docker images to find whether the chat-template being used is correct.
+# Use the Ollama model format: [namespace/]name[:tag] -- default tag is latest
+# For example: qwen2.5:14b, llama3:8b.
+# If you want to specify some other names, you can add other_names: ["other_name1", "other_name2"]. Then you can also use other_name1 or other_name2 to start the model.
 models:
-  qwen2.5-14b:
-    download_url: "https://modelscope.cn/models/Qwen/Qwen2.5-14B-Instruct-GGUF/resolve/master/qwen2.5-14b-instruct-q4_k_m.gguf"
-    container_name: "qwen2.5-14b"
+  qwen2.5:14b: 
     ctx_size: 80920
     parallel: 20
+    flash_attn: 1
+    cont_batching: 1
     chat_template: "chatml"
+    other_names: ["qwen2.5-14b"]
+  
+  rouge/nanbeige2-16b-chat:
+    ctx_size: 40960
+    parallel: 10
+    flash_attn: 1
+    cont_batching: 1
+    chat_template: "llama3"
+    other_names: ["nanbeige-16b", "nanbeige2-16b-chat"]
 
-  nanbeige-16b:
-    download_url: ""
-    container_name: "nanbeige-16b"
-    chat_template: "llama3" # refer to https://ollama.com/rouge/nanbeige2-16b-chat/blobs/4ddf52c3a1ac and https://github.com/ggml-org/llama.cpp/wiki/Templates-supported-by-llama_chat_apply_template
+  phi4:14b:
+    ctx_size: 40960
+    parallel: 10
+    flash_attn: 1
+    cont_batching: 1
+    chat_template: "phi4"
 
-  phi4-14b:
-    download_url: ""
-    container_name: "phi4-14b"
-    chat_template: "phi4" # this is not provided in the official docs (https://github.com/ggml-org/llama.cpp/blob/master/examples/server/README.md); but it works. Refer to https://github.com/ggml-org/llama.cpp/blob/a53f7f7b8859f3e634415ab03e1e295b9861d7e6/src/llama-chat.cpp
-
-  qwen2.5-7b:
-    download_url: ""
-    container_name: "qwen2.5-7b"
+  qwen2.5:7b:
     ctx_size: 80920
     parallel: 20
+    flash_attn: 1
+    cont_batching: 1
     chat_template: "chatml"
+    other_names: ["qwen2.5-7b"]
 
-  qwen2.5-coder-7b:
-    download_url: ""
-    container_name: "qwen2.5-coder-7b"
+  qwen2.5-coder:7b:
+    ctx_size: 40960
+    parallel: 10
+    flash_attn: 1
+    cont_batching: 1
     chat_template: "chatml"
+    other_names: ["qwen2.5-coder-7b"]
 
-  deepseek-coder-6.7b:
-    download_url: ""
-    container_name: "deepseek-coder-6.7b"
+  deepseek-coder:6.7b:
+    ctx_size: 40960
+    parallel: 10
+    flash_attn: 1
+    cont_batching: 1
     chat_template: "deepseek"
+    other_names: ["deepseek-coder-6.7b"]
 
   glm4:
-    download_url: ""
-    container_name: "glm4"
+    ctx_size: 40960
+    parallel: 10
+    flash_attn: 1
+    cont_batching: 1
     chat_template: "chatglm4"
-    
-  llama3.1-8b:
-    download_url: ""
-    container_name: "llama3.1-8b"
-    chat_template: "llama3"
-    
-  # all-minilm:
-  #   download_url: "https://modelscope.cn/models/AI-ModelScope/All-MiniLM-L6-v2-Embedding-GGUF/resolve/master/all-MiniLM-L6-v2-ggml-model-f16.gguf"
-  #   container_name: "all-minilm"
-  #   model_ctx_size: 256
+    other_names: ["glm4"]
 
-  # nomic-embed-text:
-  #   download_url: "https://modelscope.cn/models/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/master/nomic-embed-text-v1.5.f16.gguf"
-  #   container_name: "nomic-embed-text"
-  #   model_ctx_size: 8192
+  llama3.1:8b:
+    ctx_size: 40960
+    parallel: 10
+    flash_attn: 1
+    cont_batching: 1
+    chat_template: "llama3"
+    other_names: ["llama3.1-8b"]
+
+  all-minilm:l6-v2:
+    model_ctx_size: 256
+    tokenizer_from_HF: 'sentence-transformers/all-MiniLM-L6-v2' # https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2
+    ctx_size: 256
+    parallel: 1 # no need to parallel for embedding model, the increase is minimal
+    flash_attn: 0 # no need for embedding model
+    cont_batching: 0 # no need for embedding model
+    other_names: ["all-minilm"]
+
+  nomic-embed-text:v1.5:
+    model_ctx_size: 8192
+    tokenizer_from_HF: 'bert-base-uncased' # https://huggingface.co/nomic-ai/nomic-embed-text-v1.5
+    ctx_size: 8192
+    parallel: 1 # no need to parallel for embedding model, the increase is minimal
+    flash_attn: 0 # no need for embedding model
+    cont_batching: 0 # no need for embedding model
+    # rope_scaling: "yarn" # not sure, do not remove it yet
+    # rope_freq_scale: "0.25" # not sure, do not remove it yet
+    other_names: ["nomic-embed-text"]
 
 # Add this to your existing config.yaml
 proxies:

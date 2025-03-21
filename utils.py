@@ -3,8 +3,10 @@ import socket
 from pathlib import Path
 import docker
 from concurrent.futures import ThreadPoolExecutor
-
+import json
+import os
 import logging
+import requests
 
 def setup_logger(name):
     """Configure and return a logger instance."""
@@ -48,6 +50,100 @@ def find_next_available_port(start_port=8090, max_port=9000):
                 return port
     # If no ports are available in the range
     raise RuntimeError(f"No available ports in range {start_port}-{max_port}")
+
+def parse_ollama_model_id(model_name):
+    """Parse Ollama model name into namespace, model and tag parts."""
+    parts = model_name.split(':')
+    model_id = parts[0]
+    tag = parts[1] if len(parts) > 1 else 'latest'
+    
+    if '/' in model_id:
+        namespace, model = model_id.split('/', 1)
+    else:
+        namespace = 'library'
+        model = model_id
+        
+    return namespace, model, tag
+
+def find_ollama_model_manifest(ollama_path, model_name, is_loading_dashboard = True):
+    """Find the manifest file for an Ollama model."""
+    try:
+        namespace, model, tag = parse_ollama_model_id(model_name)
+        
+        # Handle special case for models like 'qwen2.5:14b'
+        if model == 'qwen2.5' and tag == '14b':
+            manifest_path = os.path.join(ollama_path, 'manifests', 'registry.ollama.ai', namespace, model, tag)
+        else:
+            # First try with tag as subdirectory
+            manifest_path = os.path.join(ollama_path, 'manifests', 'registry.ollama.ai', namespace, model, tag)
+            if not os.path.exists(manifest_path):
+                # Try with tag added to model name
+                manifest_path = os.path.join(ollama_path, 'manifests', 'registry.ollama.ai', namespace, f"{model}-{tag}")
+        
+        if os.path.exists(manifest_path):
+            if is_loading_dashboard:
+                logger.debug(f"Found manifest at {manifest_path}")
+            else:
+                logger.info(f"Found manifest at {manifest_path}")
+            with open(manifest_path, 'r') as f:
+                return json.load(f)
+        else:
+            logger.warning(f"Manifest not found at {manifest_path}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error finding manifest for model {model_name}: {str(e)}")
+        return None
+
+def find_ollama_model_file(ollama_path, model_name, is_loading_dashboard = True):
+    """Find the GGUF file for a model in the Ollama repository."""
+    manifest = find_ollama_model_manifest(ollama_path, model_name, is_loading_dashboard)
+    if not manifest:
+        logger.error(f"Could not find manifest for model {model_name}")
+        return None
+        
+    try:
+        # Look for model layer
+        model_digest = None
+        for layer in manifest.get('layers', []):
+            if layer.get('mediaType') == 'application/vnd.ollama.image.model':
+                model_digest = layer.get('digest')
+                break
+                
+        if not model_digest:
+            logger.error(f"No model layer found in manifest for {model_name}")
+            return None
+            
+        # Extract the SHA256 hash
+        if model_digest.startswith('sha256:'):
+            sha256_hash = model_digest.split(':', 1)[1]
+            model_blob_path = os.path.join(ollama_path, 'blobs', f'sha256-{sha256_hash}')
+            
+            if os.path.exists(model_blob_path):
+                if is_loading_dashboard:
+                    logger.debug(f"Found model file at {model_blob_path}")
+                else:
+                    logger.info(f"Found model file at {model_blob_path}")
+                return model_blob_path
+            else:
+                logger.error(f"Model blob not found at {model_blob_path}")
+                return None
+        else:
+            logger.error(f"Invalid digest format: {model_digest}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error extracting model path from manifest for {model_name}: {str(e)}")
+        return None
+
+def is_ollama_model_available(ollama_path, model_name, is_loading_dashboard = True):
+    """Check if a model is available in the Ollama repository."""
+    if not ollama_path or not os.path.isdir(ollama_path):
+        logger.warning(f"Ollama path {ollama_path} is not a valid directory")
+        return False
+        
+    model_file = find_ollama_model_file(ollama_path, model_name, is_loading_dashboard)
+    return model_file is not None
 
 def download_model(model_name, download_url, model_base_path):
     """Download model using axel, wget, or curl if it doesn't exist."""
@@ -185,14 +281,23 @@ def ensure_models_exist(models_config, model_base_path):
         return False
     return True
 
-def is_container_running(container_name, docker_client):
-    """Check if a container is running using Docker SDK."""
+def is_container_running(port, container_name):
+    """Check if a container is running and ready to accept requests using Docker SDK."""
     try:
-        # Only get running containers
-        containers = docker_client.containers.list(filters={"name": container_name}, all=False)
-        return len(containers) > 0
+
+        # Try to connect to the health check endpoint
+        try:
+            response = requests.get(f'http://localhost:{port}/health', timeout=2)
+            return response.status_code == 200
+        except requests.exceptions.RequestException as e:
+            logger.debug(f"Container {container_name} is not ready yet: {str(e)}")
+            return False
+            
     except docker.errors.APIError as e:
         logger.error(f"Error checking if container {container_name} is running: {str(e)}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error checking container {container_name}: {str(e)}")
         return False
 
 def get_container(container_name, docker_client, all=True):

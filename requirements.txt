@@ -1,4 +1,6 @@
 flask>=2.0.0
 requests>=2.25.0
 docker>=6.0.0
-pyyaml>=5.4.0 
+pyyaml>=5.4.0
+transformers>=4.30.0
+torch>=2.0.0 
