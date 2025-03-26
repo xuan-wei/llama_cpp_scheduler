@@ -39,11 +39,11 @@ While Ollama provides a user-friendly interface for running LLMs, I met a signif
    ```
 
 3. Configure your models in `config.yaml`. Several key points:
+   - Set `debug` to `true` when debugging (debug port: 5001). When `debug=false`, the port is 5000
    - Set the path to your Ollama models repository (necessary if you want to re-use Ollama models)
    - Set the HF_path to your HuggingFace cache path (necessary if you want to re-use locally downloaded models from HuggingFace)
    - Set model-specific parameters
      - **Naming**: Use the Ollama model format: `[namespace/]name[:tag]` (e.g., `qwen2.5:14b`, `llama3:8b`)
-     - **Chat Completion**: Set `ctx_size`, `parallel`, `flash_attn`, `cont_batching`, and `chat_template` properly. For chat completion, check [here](https://github.com/ggml-org/llama.cpp/blob/master/examples/server/README.md) and [here](https://github.com/ggml-org/llama.cpp/wiki/Templates-supported-by-llama_chat_apply_template). 
      - **Embedding**: Set `model_ctx_size` properly to match the tokenizer's context window. Need to check the official docs of the model you are using (`important and necessary`); Or, the truncation won't work and it will raise error. Note: Embedding models don't benefit much from `parallel`, `flash_attn`, or `cont_batching` settings. Set `parallel` to 1 and turn off `flash_attn` and `cont_batching`.
 
 

@@ -7,14 +7,15 @@ import docker
 import signal
 import sys
 import yaml
-from utils import (get_best_gpu, find_next_available_port, ensure_models_exist, 
-                   is_container_running, get_container, setup_logger, is_ollama_model_available, find_ollama_model_file)
-from pathlib import Path
-from collections import defaultdict, deque
-from datetime import datetime, timedelta
-import os
+from utils import (setup_logger, is_ollama_model_available, find_ollama_model_file, 
+                   find_next_available_port, get_best_gpu, process_chunk)
+from utils_docker import (start_container, get_container_status, stop_container,
+                         wait_for_container_ready, stop_all_containers)
+
+from dashboard_template import (get_dashboard_header, get_dashboard_footer, get_error_page)
+from collections import deque
+from datetime import datetime
 from transformers import AutoTokenizer
-import torch
 import subprocess
 
 logger = setup_logger('scheduler')
@@ -94,193 +95,15 @@ def get_container_lock(container_name):
             container_locks[container_name] = Lock()
         return container_locks[container_name]
 
-def start_container(model_name, service_type, model_file_path=None):
-    """Start a Docker container with the specified parameters using Docker SDK."""
-    if model_name not in model_configs:
-        logger.error(f"Model {model_name} not found in configuration")
-        return False
-    
-    config = model_configs[model_name]
-    container_name = config["container_name"]
-    
-    try:
-        # Check if container is already running
-        if is_container_running(model_configs[model_name]["port"], container_name):
-            logger.info(f"Container {container_name} is already running")
-            return True
-        
-        # Check if container exists but is stopped
-        existing_container = get_container(container_name, docker_client)
-        if existing_container:
-            logger.info(f"Found existing container {container_name} in state: {existing_container.status}")
-            try:
-                logger.info(f"Removing existing container {container_name}")
-                existing_container.remove(force=True)
-                logger.info(f"Successfully removed existing container {container_name}")
-            except docker.errors.APIError as e:
-                logger.error(f"Error removing existing container {container_name}: {str(e)}")
-                return False
-        
-        # Get the best GPU to use
-        config["device_id"] = get_best_gpu(FORCE_GPU_ID)
-        logger.info(f"Selected GPU {config['device_id']} for model {model_name}")
-        
-        # If no port is assigned, find the next available one
-        config["port"] = find_next_available_port(start_port=8090)
-        logger.info(f"Assigned port {config['port']} to model {model_name}")
-        
-        # Prepare environment variables and command
-        environment = {
-            "CUDA_VISIBLE_DEVICES": str(config["device_id"]),
-        }
-        if HF_MIRROR:
-            environment["HF_MIRROR"] = HF_MIRROR
-        
-        # Prepare port mapping
-        ports = {f"{config['port']}/tcp": config['port']}
-                
-        # Prepare command
-        command = [
-            "--model", model_file_path,
-            "--n-gpu-layers", str(config["n_gpu_layers"]),
-            "--host", "0.0.0.0",
-            "--port", str(config["port"]),
-            "--threads", str(config["threads"]),  
-        ]
-        if config["cont_batching"]:
-            command.extend(["--cont-batching"])
-        if config["flash_attn"]:
-            command.extend(["--flash-attn"])
-        
-        command.extend(["--ctx-size", str(config["ctx_size"])])
-        command.extend(["--parallel", str(config["parallel"])])
-
-        if service_type == 'chat':          
-            command.extend(["--predict", str(config["predict"])])
-            command.extend(["--ctx-size", str(config["ctx_size"])])
-            command.extend(["--parallel", str(config["parallel"])])
-            if config.get("chat_template"):
-                command.extend(["--chat-template", config["chat_template"]])
-
-        if service_type == 'embedding':          
-            # Add embedding-specific parameters
-            command.extend(["--embedding",
-                            "--batch-size", str(config["model_ctx_size"]),
-                            "--ubatch-size", str(config["model_ctx_size"])])
-            if config.get("rope_scaling"):
-                command.extend(["--rope-scaling", config["rope_scaling"]])
-            if config.get("rope_freq_scale"):
-                command.extend(["--rope-freq-scale", config["rope_freq_scale"]])
-            
-        volumes = {}
-        
-        # Mount Ollama repository
-        if OLLAMA_PATH and os.path.isdir(OLLAMA_PATH):
-            logger.info(f"Mounting Ollama repository: {OLLAMA_PATH}")
-            volumes[OLLAMA_PATH] = {'bind': '/ollama_models', 'mode': 'ro'}
-            
-            # Adjust the model path in the command
-            ollama_rel_path = os.path.relpath(model_file_path, OLLAMA_PATH)
-            command[1] = f"/ollama_models/{ollama_rel_path}"
-            logger.info(f"Adjusted model path: {command[1]}")
-        
-        # Log the full command for debugging
-        logger.info(f"Starting container {container_name} on device {config['device_id']} with command: {' '.join(command)}")
-        
-        # Create and start the container
-        container = docker_client.containers.run(
-            DOCKER_IMAGE,
-            command=command,
-            name=container_name,
-            detach=True,
-            environment=environment,
-            ports=ports,
-            volumes=volumes,
-            runtime="nvidia"  # Remove if not using NVIDIA GPU
-        )
-        
-        logger.info(f"Container {container_name} started with ID: {container.id}")
-        
-        # Wait for the container to be ready
-        if not wait_for_container_ready(model_name):
-            logger.error(f"Container {container_name} failed to become ready")
-            return False
-        
-        return True
-        
-    except docker.errors.APIError as e:
-        logger.error(f"Error starting container {container_name}: {str(e)}")
-        return False
-    except Exception as e:
-        logger.error(f"Unexpected error starting container {container_name}: {str(e)}")
-        return False
-
-def stop_container(model_name):
-    """Stop a Docker container using Docker SDK."""
-    if model_name not in model_configs:
-        logger.error(f"Model {model_name} not found in configuration")
-        return False
-    
-    container_name = model_configs[model_name]["container_name"]
-    
-    # Get the lock for this specific container
-    container_lock = get_container_lock(container_name)
-    
-    # Acquire the lock to ensure only one thread can stop this container
-    with container_lock:
-        try:
-            # Find the container
-            container = get_container(container_name, docker_client)
-            
-            if not container:
-                logger.info(f"Container {container_name} is not running")
-                return True
-            
-            # Stop and remove the container
-            logger.info(f"Stopping container {container_name} (ID: {container.id})")
-            container.stop(timeout=10)  # Give it 10 seconds to stop gracefully
-            container.remove()
-            logger.info(f"Container {container_name} stopped and removed")
-            return True
-            
-        except docker.errors.APIError as e:
-            logger.error(f"Error stopping container {container_name}: {str(e)}")
-            return False
-        except Exception as e:
-            logger.error(f"Unexpected error stopping container {container_name}: {str(e)}")
-            return False
-
-def stop_all_containers():
-    """Stop all containers in model_configs."""
-    logger.info("Stopping all containers...")
-    
-    for model_name, config in model_configs.items():
-        container_name = config["container_name"]
-        if is_container_running(model_configs[model_name]["port"], container_name):
-            logger.info(f"Stopping container {container_name} for model {model_name}")
-            if stop_container(model_name):
-                logger.info(f"Successfully stopped container {container_name}")
-            else:
-                logger.error(f"Failed to stop container {container_name}")
-    
-    logger.info("All containers stopped")
-
-def update_last_request_time(model_name):
-    """Update the last request time for a specific model."""
-    with model_lock:
-        model_last_request[model_name] = time.time()
-        logger.debug(f"Updated last request time for {model_name}")
-
 def process_request(url, data):
     """Stream the request to the specified URL and process the response."""
+    proxies = config.get('proxies', {"http": None, "https": None})
     try:
-        proxies = config.get('proxies', {"http": None, "https": None})
         with requests.post(url, json=data, timeout=REQUEST_TIMEOUT, proxies=proxies, stream=True) as response: 
             response.raise_for_status()
             for chunk in response.iter_content(chunk_size=8192):
                 if chunk:
                     # Process the chunk if needed
-                    # For example, you could decode it or transform it
                     processed_chunk = process_chunk(chunk)
                     yield processed_chunk
     except requests.exceptions.Timeout:
@@ -289,14 +112,6 @@ def process_request(url, data):
         yield json.dumps({"error": f"Error forwarding request: {str(e)}"}).encode('utf-8')
     except json.JSONDecodeError:
         yield json.dumps({"error": "Invalid response from model server"}).encode('utf-8')
-
-def process_chunk(chunk):
-    """Process a chunk of data."""
-    # Example processing: decode the chunk
-    try:
-        return chunk.decode('utf-8')
-    except UnicodeDecodeError:
-        return chunk  # Return raw chunk if decoding fails
 
 def load_tokenizer(tokenizer_name):
     """Load a tokenizer from HF and cache it for future use."""
@@ -320,6 +135,222 @@ def load_tokenizer(tokenizer_name):
         except Exception as e:
             logger.error(f"Error loading tokenizer {tokenizer_name}: {str(e)}")
             return None
+
+def check_model_health(model_name):
+    """
+    Check if a model's health endpoint is responding correctly.
+    
+    Args:
+        model_name: The name of the model to check
+        
+    Returns:
+        bool: True if health check passes, False otherwise
+    """
+    if model_name not in model_configs:
+        logger.error(f"Model {model_name} not found in configuration")
+        return False
+        
+    port = model_configs[model_name]["port"]
+    if not port:
+        logger.error(f"No port assigned for model {model_name}")
+        return False
+        
+    health_url = f"http://localhost:{port}/health"
+    try:
+        proxies = config.get('proxies', {"http": None, "https": None})
+        response = requests.get(health_url, timeout=5, proxies=proxies)
+        if response.status_code == 200:
+            logger.debug(f"Health check for {model_name} successful")
+            return True
+        else:
+            logger.debug(f"Health check for {model_name} failed with status code {response.status_code}")
+            return False
+    except requests.exceptions.RequestException as e:
+        logger.debug(f"Health check for {model_name} failed: {str(e)}")
+        return False
+
+def get_model_container_ready(model_name, service_type, start_time):
+    """
+    Prepare a container for the specified model.
+    First checks if an existing container is healthy,
+    then tries to start an exited container,
+    finally creates a new container if needed.
+    
+    Returns:
+        bool: True if container is ready, False if failed
+    """
+    container_name = model_configs[model_name]["container_name"]
+    
+    # First, directly check if the model is ready via health check
+    # This is the most reliable method and can save time
+    if check_model_health(model_name):
+        logger.debug(f"Model {model_name} is already running and healthy")
+        return True
+    
+    # If health check failed, check container status to determine next steps
+    exists, container_status = get_container_status(container_name, docker_client)
+    
+    # If container is running but health check failed, it's in a bad state
+    if exists and container_status == 'running':
+        logger.warning(f"Container {container_name} is running but health check failed, will remove and recreate")
+        try:
+            container = docker_client.containers.get(container_name)
+            container.remove(force=True)
+            exists = False  # Reset exists flag to trigger recreation
+        except Exception as e:
+            logger.error(f"Error removing unhealthy container {container_name}: {str(e)}")
+            return False
+    
+    # Try to start the container if it exists and is in 'exited' state
+    if exists and container_status == 'exited':
+        logger.info(f"Found exited container {container_name}, attempting to start it")
+        try:
+            container = docker_client.containers.get(container_name)
+            container.start()
+            
+            # Wait for container to become ready using health check
+            max_retries = CONTAINER_STARTUP_TIMEOUT // HEALTH_CHECK_INTERVAL
+            retry_count = 0
+            
+            while retry_count < max_retries:
+                if check_model_health(model_name):
+                    logger.info(f"Successfully started existing container {container_name}")
+                    return True
+                time.sleep(HEALTH_CHECK_INTERVAL)
+                retry_count += 1
+                logger.debug(f"Waiting for model {model_name} to be ready, attempt {retry_count}/{max_retries}")
+            
+            logger.warning(f"Container {container_name} started but health check failed, will remove and recreate")
+            # Remove the container since it failed to become ready
+            container.remove(force=True)
+            exists = False  # Reset exists flag to trigger recreation
+        except Exception as e:
+            logger.warning(f"Failed to start existing container {container_name}: {str(e)}, will remove and recreate")
+            # Try to remove the container so we can create a new one
+            try:
+                container = docker_client.containers.get(container_name)
+                container.remove(force=True)
+            except Exception as remove_error:
+                logger.error(f"Error removing container after failed start: {str(remove_error)}")
+            exists = False  # Reset exists flag to trigger recreation
+    
+    # If container doesn't exist or needs recreation, check model availability and create new container
+    if not exists:
+        if not OLLAMA_PATH:
+            logger.error("Ollama path is not configured")
+            update_model_stats(model_name, time.time() - start_time, success=False)
+            return False
+            
+        if not check_model_availability(model_name, is_loading_dashboard=False):
+            logger.info(f"Model {model_name} not found in Ollama repository, attempting to download")
+            try:
+                # Use ollama pull to download the model
+                logger.info(f"Pulling model {model_name} using ollama pull")
+                result = subprocess.run(['ollama', 'pull', model_name], 
+                                    capture_output=True, 
+                                    text=True, 
+                                    check=True)
+                logger.info(f"Successfully pulled model {model_name}")
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Failed to pull model {model_name}: {e.stderr}")
+                update_model_stats(model_name, time.time() - start_time, success=False)
+                return False
+            except Exception as e:
+                logger.error(f"Unexpected error pulling model {model_name}: {str(e)}")
+                update_model_stats(model_name, time.time() - start_time, success=False)
+                return False
+            
+            # Check if the model is now available
+            if not check_model_availability(model_name, is_loading_dashboard=False):
+                logger.error(f"Model {model_name} still not available after pull attempt")
+                update_model_stats(model_name, time.time() - start_time, success=False)
+                return False
+            
+            logger.info(f"Successfully downloaded model {model_name}")
+        
+        model_file_path = find_ollama_model_file(OLLAMA_PATH, model_name)
+        logger.info(f"Found model {model_name} in Ollama repository at {model_file_path}")
+        
+        logger.info(f"Starting container for {model_name}")
+        is_success = start_model_container(model_name, service_type, model_file_path)
+        return is_success
+    
+    # If we reach here, something unexpected happened
+    logger.error(f"Failed to prepare container for {model_name}, state: exists={exists}, status={container_status}")
+    return False
+
+def process_embedding_input(data, model_name, model_ctx_size, tokenizer_model):
+    """
+    Process embedding input with the appropriate tokenizer and truncate if necessary.
+    
+    Args:
+        data: The request data containing input text
+        model_name: Name of the model
+        model_ctx_size: Context size of the model
+        tokenizer_model: HuggingFace tokenizer model name
+    
+    Returns:
+        bool: True if processing was successful, False otherwise
+    """
+    # Get tokenizer from cache or load it if not cached
+    tokenizer = load_tokenizer(tokenizer_model)
+    if not tokenizer:
+        return False
+        
+    try:
+        # Calculate prefix length if not already done
+        if model_name not in embedding_model_prefix_length:
+            with embedding_model_prefix_length_lock:
+                # Only calculate if not already done
+                with tokenizer_operation_lock:
+                    tokens = tokenizer('1', return_tensors="pt", truncation=True, max_length=100, add_special_tokens=True)
+                    prefix_length = tokens.input_ids.shape[1] - 1
+                    embedding_model_prefix_length[model_name] = prefix_length
+                    # Explicitly delete tensor to release memory
+                    del tokens
+        
+        safe_max_length = model_ctx_size - embedding_model_prefix_length[model_name]
+        
+        # Process the input data for tokenization
+        if 'input' in data:
+            if isinstance(data['input'], str):
+                # For single string input
+                input_text = data['input']
+                if len(input_text) > 0:
+                    with tokenizer_operation_lock:
+                        try:
+                            tokens = tokenizer(input_text, return_tensors="pt", truncation=True, 
+                                          max_length=safe_max_length, add_special_tokens=False)
+                            # Replace the input text with the processed text if it's longer than the max length
+                            if tokens.input_ids.shape[1] >= safe_max_length:
+                                processed_text = tokenizer.decode(tokens.input_ids[0], skip_special_tokens=True)
+                                data['input'] = processed_text
+                            # Explicitly delete tensor
+                            del tokens
+                        except Exception as e:
+                            logger.error(f"Error tokenizing string input: {str(e)}")
+            
+            elif isinstance(data['input'], list):
+                # For list input, process each item separately
+                for i, text in enumerate(data['input']):
+                    if isinstance(text, str) and len(text) > 0:
+                        with tokenizer_operation_lock:
+                            try:
+                                tokens = tokenizer(text, return_tensors="pt", truncation=True, 
+                                              max_length=safe_max_length, add_special_tokens=False)
+                                # Replace the input text with the processed text if it's longer than the max length
+                                if tokens.input_ids.shape[1] >= safe_max_length:
+                                    processed_text = tokenizer.decode(tokens.input_ids[0], skip_special_tokens=True)
+                                    data['input'][i] = processed_text
+                                # Explicitly delete tensor
+                                del tokens
+                            except Exception as e:
+                                logger.error(f"Error tokenizing list item {i}: {str(e)}")
+        return True
+                
+    except Exception as e:
+        logger.error(f"Error using HF tokenizer: {str(e)}")
+        return False
 
 def handle_request(data, endpoint, service_type):
     """Generalized logic for handling requests."""
@@ -350,201 +381,126 @@ def handle_request(data, endpoint, service_type):
      
     # Use the lock to ensure only one thread can check/start the container
     with container_lock:
-        # Check if container is running by checking if it's ready
-        if not is_container_running(model_configs[model_name]["port"], container_name):
-            logger.info(f"Container for {model_name} is not running, checking model availability")
-            
-            # Check if the model exists in Ollama repository
-            if not OLLAMA_PATH:
-                logger.error("Ollama path is not configured")
-                update_model_stats(model_name, time.time() - start_time, success=False)
-                return jsonify({"error": "Ollama path is not configured"}), 400
-                
-            if not check_model_availability(model_name, is_loading_dashboard=False):
-                logger.info(f"Model {model_name} not found in Ollama repository, attempting to download")
-                try:
-                    # Use ollama pull to download the model
-                    logger.info(f"Pulling model {model_name} using ollama pull")
-                    result = subprocess.run(['ollama', 'pull', model_name], 
-                                         capture_output=True, 
-                                         text=True, 
-                                         check=True)
-                    logger.info(f"Successfully pulled model {model_name}")
-                except subprocess.CalledProcessError as e:
-                    logger.error(f"Failed to pull model {model_name}: {e.stderr}")
-                    update_model_stats(model_name, time.time() - start_time, success=False)
-                    return jsonify({"error": f"Failed to pull model {model_name}: {e.stderr}"}), 500
-                except Exception as e:
-                    logger.error(f"Unexpected error pulling model {model_name}: {str(e)}")
-                    update_model_stats(model_name, time.time() - start_time, success=False)
-                    return jsonify({"error": f"Unexpected error pulling model {model_name}"}), 500
-                
-                # Check if the model is now available
-                if not check_model_availability(model_name, is_loading_dashboard=False):
-                    logger.error(f"Model {model_name} still not available after pull attempt")
-                    update_model_stats(model_name, time.time() - start_time, success=False)
-                    return jsonify({"error": f"Model {model_name} not available after pull attempt"}), 500
-                
-                logger.info(f"Successfully downloaded model {model_name}")
-            
-            model_file_path = find_ollama_model_file(OLLAMA_PATH, model_name)
-            logger.info(f"Found model {model_name} in Ollama repository at {model_file_path}")
-            
-            logger.info(f"Starting container for {model_name}")
-            is_success = start_container(model_name, service_type, model_file_path)
-            if not is_success:
-                update_model_stats(model_name, time.time() - start_time, success=False)
-                return jsonify({"error": f"Failed to start container for {model_name}"}), 500
+        # Prepare the container for this model
+        if not get_model_container_ready(model_name, service_type, start_time):
+            return jsonify({"error": f"Failed to prepare container for {model_name}"}), 500
             
     # Update last request time
     update_last_request_time(model_name)
     
-    url_to_forward = None
-    if service_type == 'chat':
-        url_to_forward = 'v1/chat/completions'
-    elif service_type == 'embedding':
-        url_to_forward = 'v1/embeddings'
-        
+    # Determine endpoint to forward request to
+    url_to_forward = 'v1/chat/completions' if service_type == 'chat' else 'v1/embeddings' if service_type == 'embedding' else None
+    
+    # Handle tokenization for embedding requests if needed
+    if service_type == 'embedding':
         # Check if this model has HF tokenizer configuration
         model_config = config['models'][model_name]
         if 'tokenizer_from_HF' in model_config and 'model_ctx_size' in model_config:
-            model_ctx_size = model_config['model_ctx_size']
-            tokenizer_model = model_config['tokenizer_from_HF']
-            
-            # Get tokenizer from cache or load it if not cached
-            tokenizer = load_tokenizer(tokenizer_model)
-            
-            if tokenizer:
-                try:
-                    # For embedding models, we need to calculate the prefix length of the model
-                    # because the tokenizer will add special tokens to the input text
-                    if model_name not in embedding_model_prefix_length:
-                        with embedding_model_prefix_length_lock:
-                            # Only calculate if not already done
-                            with tokenizer_operation_lock:
-                                tokens = tokenizer('1', return_tensors="pt", truncation=True, max_length=100, add_special_tokens=True)
-                                prefix_length = tokens.input_ids.shape[1] - 1
-                                embedding_model_prefix_length[model_name] = prefix_length
-                                # Explicitly delete tensor to release memory
-                                del tokens
-                    
-                    safe_max_length = model_ctx_size - embedding_model_prefix_length[model_name]
-                    
-                    # Process the input data for tokenization
-
-                    if 'input' in data:
-                        if isinstance(data['input'], str):
-                            # For single string input
-                            input_text = data['input']
-                            if len(input_text) > 0:
-                                with tokenizer_operation_lock:
-                                    try:
-                                        tokens = tokenizer(input_text, return_tensors="pt", truncation=True, 
-                                                       max_length=safe_max_length, add_special_tokens=False)
-                                        # Replace the input text with the processed text if it's longer than the max length
-                                        if tokens.input_ids.shape[1] >= safe_max_length:
-                                            processed_text = tokenizer.decode(tokens.input_ids[0], skip_special_tokens=True)
-                                            data['input'] = processed_text
-                                        # Explicitly delete tensor
-                                        del tokens
-                                    except Exception as e:
-                                        logger.error(f"Error tokenizing string input: {str(e)}")
-                        
-                        elif isinstance(data['input'], list):
-                            # For list input, process each item separately
-                            for i, text in enumerate(data['input']):
-                                if isinstance(text, str) and len(text) > 0:
-                                    with tokenizer_operation_lock:
-                                        try:
-                                            tokens = tokenizer(text, return_tensors="pt", truncation=True, 
-                                                          max_length=safe_max_length, add_special_tokens=False)
-                                            # Replace the input text with the processed text if it's longer than the max length
-                                            if tokens.input_ids.shape[1] >= safe_max_length:
-                                                processed_text = tokenizer.decode(tokens.input_ids[0], skip_special_tokens=True)
-                                                data['input'][i] = processed_text
-                                            # Explicitly delete tensor
-                                            del tokens
-                                        except Exception as e:
-                                            logger.error(f"Error tokenizing list item {i}: {str(e)}")
-                            
-                except Exception as e:
-                    logger.error(f"Error using HF tokenizer: {str(e)}")
-                    # Continue with default processing if tokenizer fails
-                
-    # Forward the processed request to the appropriate API endpoint
+            # Process embedding input with tokenizer
+            process_embedding_input(
+                data, 
+                model_name, 
+                model_config['model_ctx_size'], 
+                model_config['tokenizer_from_HF']
+            )
+    
+    # If no valid endpoint, return error        
     if not url_to_forward:
         update_model_stats(model_name, time.time() - start_time, success=False)
         return jsonify({"error": "Invalid service type"}), 400
 
-    # Forward the request
+    # Prepare for request
     port = model_configs[model_name]["port"]
     url = f'http://localhost:{port}/{url_to_forward}'
     
-    # For embeddings, use non-streaming request to process the response
-    if service_type == 'embedding':
-        try:
+    try:
+        # Use different handling for embedding vs. chat requests
+        if service_type == 'embedding':
+            # Direct request (non-streaming) for embeddings
             proxies = config.get('proxies', {"http": None, "https": None})
-            
-            # Use a direct request instead of streaming for better performance
             response = requests.post(url, json=data, timeout=REQUEST_TIMEOUT, proxies=proxies)
             response.raise_for_status()
             
             # Process the embedding response
             response_json = response.json()
             
-            # Round embedding values to match Ollama's precision and format
+            # Round embedding values to match Ollama's precision
             if "data" in response_json and isinstance(response_json["data"], list):
                 for item in response_json["data"]:
                     if "embedding" in item and isinstance(item["embedding"], list):
-                        # Round embedding values to match Ollama's precision (9 decimal places)
                         item["embedding"] = [float(f"{value:.9f}") for value in item["embedding"]]
             
-            # Update stats for successful request
-            total_time = time.time() - start_time
-            update_model_stats(model_name, total_time, success=True)
+            result = jsonify(response_json), response.status_code
+        else:
+            # Streaming response for chat completions
+            result = Response(process_request(url, data), content_type='application/json')
+        
+        # Update stats for successful request
+        update_model_stats(model_name, time.time() - start_time, success=True)
+        return result
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error forwarding request to {model_name}: {str(e)}")
+        update_model_stats(model_name, time.time() - start_time, success=False)
+        return jsonify({"error": f"Error communicating with model server: {str(e)}"}), 500
+    except Exception as e:
+        logger.error(f"Error processing response: {str(e)}")
+        update_model_stats(model_name, time.time() - start_time, success=False)
+        return jsonify({"error": f"Error processing response: {str(e)}"}), 500
+
+
+def start_model_container(model_name, service_type, model_file_path=None):
+    """Start a Docker container for a specific model."""
+    container_name = model_configs[model_name]["container_name"]
+
+    # Get the best GPU to use if not already assigned
+    if model_configs[model_name]["device_id"] is None:
+        model_configs[model_name]["device_id"] = get_best_gpu(FORCE_GPU_ID)
+    
+    # Find next available port if not already assigned
+    if model_configs[model_name]["port"] is None:
+        model_configs[model_name]["port"] = find_next_available_port(start_port=8090)
+        
+    # Start the container using the utility function
+    result = start_container(
+        model_name, 
+        model_configs, 
+        docker_client, 
+        DOCKER_IMAGE, 
+        service_type, 
+        model_file_path, 
+        OLLAMA_PATH, 
+        HF_MIRROR
+    )
+    
+    if result:
+        # Wait for container to become ready using health check
+        max_retries = CONTAINER_STARTUP_TIMEOUT // HEALTH_CHECK_INTERVAL
+        retry_count = 0
+        is_healthy = False
             
-            # Return the modified response
-            return jsonify(response_json), response.status_code
+        while retry_count < max_retries:
+            if check_model_health(model_name):
+                is_healthy = True
+                break
+            time.sleep(HEALTH_CHECK_INTERVAL)
+            retry_count += 1
+            logger.debug(f"Waiting for model {model_name} to be ready, attempt {retry_count}/{max_retries}")
             
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error forwarding request to {model_name}: {str(e)}")
-            update_model_stats(model_name, time.time() - start_time, success=False)
-            return jsonify({"error": f"Error communicating with model server: {str(e)}"}), 500
-        except Exception as e:
-            logger.error(f"Error processing embedding response: {str(e)}")
-            update_model_stats(model_name, time.time() - start_time, success=False)
-            return jsonify({"error": f"Error processing response: {str(e)}"}), 500
-    else:
-        # For other request types, use streaming response
-        try:
-            response = Response(process_request(url, data), content_type='application/json')
-            # Update stats for successful request
-            update_model_stats(model_name, time.time() - start_time, success=True)
-            return response
-        except Exception as e:
-            logger.error(f"Error forwarding request to {model_name}: {str(e)}")
-            update_model_stats(model_name, time.time() - start_time, success=False)
-            return jsonify({"error": f"Error communicating with model server: {str(e)}"}), 500
-
-@app.route('/v1/chat/completions', methods=['POST'])
-def handle_chat_completion():
-    """Handle OpenAI chat completions endpoint."""
-    return handle_request(request.json, '/v1/chat/completions', 'chat')
-
-@app.route('/api/chat', methods=['POST'])
-def handle_api_chat():
-    """Handle chat requests to the /api/chat endpoint."""
-    return handle_request(request.json, '/api/chat', 'chat')
-
-@app.route('/v1/embeddings', methods=['POST'])
-def handle_embeddings():
-    """Handle requests to the /v1/embeddings endpoint."""
-    return handle_request(request.json, '/v1/embeddings', 'embedding' )
-
-@app.route('/api/embed', methods=['POST'])
-def handle_api_embed():
-    """Handle requests to the /api/embed endpoint."""
-    return handle_request(request.json, '/api/embed', 'embedding' )
+        if is_healthy:
+            logger.info(f"Container {container_name} is running and healthy")
+            return True
+        else:
+            logger.error(f"Container {container_name} failed to become healthy")
+            # Try to remove the unhealthy container
+            try:
+                container = docker_client.containers.get(container_name)
+                container.remove(force=True)
+            except Exception as e:
+                logger.error(f"Error removing unhealthy container: {str(e)}")
+            return False
+                
+        return result
 
 def monitor_inactivity():
     """Monitor for inactivity and stop containers that have been idle too long."""
@@ -553,65 +509,43 @@ def monitor_inactivity():
         time.sleep(INACTIVITY_CHECK_INTERVAL)  # Check every minute
         current_time = time.time()
         
+        # Create a list of models to stop without holding the model_lock
+        models_to_stop = []
+        
         with model_lock:
             for model_name, last_time in list(model_last_request.items()):
                 if current_time - last_time > INACTIVITY_TIMEOUT:
                     if model_name in model_configs:
-                        container_name = model_configs[model_name]["container_name"]
-                        if is_container_running(model_configs[model_name]["port"], container_name):
-                            logger.info(f"Container {container_name} has been idle for {current_time - last_time:.1f} seconds, stopping")
-                            stop_container(model_name)
-                            del model_last_request[model_name]
-
-# Ensure wait_for_container_ready is robust
-def wait_for_container_ready(model_name, timeout=CONTAINER_STARTUP_TIMEOUT):
-    """Wait for the container to be ready, with timeout."""
-    container_name = model_configs[model_name]["container_name"]
-    if model_name not in model_configs:
-        return False
-    
-    # Give the container a moment to initialize before checking
-    logger.info(f"Waiting for initial container startup for {model_name}")
-    time.sleep(HEALTH_CHECK_INTERVAL)
-    
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        if is_container_running(model_configs[model_name]["port"], container_name):
-            logger.info(f"Container for {model_name} is ready")
-            return True
+                        models_to_stop.append(model_name)
         
-        # Log progress during waiting
-        elapsed = time.time() - start_time
-        if elapsed > HEALTH_CHECK_INTERVAL and elapsed % 10 < HEALTH_CHECK_INTERVAL:  # Log every ~10 seconds
-            # Check container logs to see if there are any issues
-            try:
-                container = get_container(container_name, docker_client, all=False)
-                if container:
-                    logs = container.logs(tail=10).decode('utf-8', errors='replace')
-                    logger.info(f"Waiting for {model_name} to be ready... ({elapsed:.1f}s elapsed)")
-                    logger.info(f"Recent container logs: {logs}")
-            except Exception as e:
-                logger.error(f"Error getting container logs: {str(e)}")
-            
-        time.sleep(HEALTH_CHECK_INTERVAL)
-    
-    # If we timed out, get the container logs to help diagnose the issue
-    try:
-        container_name = model_configs[model_name]["container_name"]
-        container = get_container(container_name, docker_client, all=False)
-        if container:
-            logs = container.logs(tail=50).decode('utf-8', errors='replace')
-            logger.error(f"Container logs for {model_name} after timeout: {logs}")
-    except Exception as e:
-        logger.error(f"Error getting container logs after timeout: {str(e)}")
-    
-    logger.error(f"Timeout waiting for {model_name} container to be ready")
-    return False
+        # Now stop the containers without holding the model_lock
+        for model_name in models_to_stop:
+            container_name = model_configs[model_name]["container_name"]
+            # Check if container exists in any state
+            exists, status = get_container_status(container_name, docker_client)
+            if exists:
+                logger.info(f"Container {container_name} has been idle for {current_time - model_last_request.get(model_name, 0):.1f} seconds, stopping (current status: {status})")
+                
+                # Get the lock for this specific container
+                container_lock = get_container_lock(container_name)
+                
+                # Acquire the lock to ensure only one thread can stop this container
+                with container_lock:
+                    logger.info(f"Stopping container {container_name} for model {model_name}")
+                    # Use the utility function to stop and remove the container
+                    stop_result = stop_container(container_name, docker_client, remove=True)
+                    if not stop_result:
+                        logger.error(f"Failed to stop container {container_name}")
+                
+                # Now remove from last request tracking
+                with model_lock:
+                    if model_name in model_last_request:
+                        del model_last_request[model_name]
 
 def signal_handler(sig, frame):
     """Handle shutdown signals by stopping all containers before exiting."""
     logger.info("Shutdown signal received, stopping all containers...")
-    stop_all_containers()
+    stop_all_containers(model_configs, docker_client)
     logger.info("All containers stopped, exiting...")
     sys.exit(0)
 
@@ -633,24 +567,24 @@ def init_model_stats(model_name):
             "last_check": time.time()  # Add timestamp of last availability check
         }
 
-def get_stats_for_period(model_name, period_seconds):
-    """Calculate statistics for a specific time period."""
-    if model_name not in model_stats:
+def get_stats_for_period(model_name, period_seconds, stats_data):
+    """Calculate statistics for a specific time period using provided stats data."""
+    # Use the stats data passed in rather than acquiring locks again
+    if not stats_data:
         return 0, 0, 0, 0
     
-    stats = model_stats[model_name]
     now = time.time()
     period_start = now - period_seconds
     
     # Get all the requests and their success status within the time period
-    period_requests = [(ts, success) for ts, success in zip(stats["request_timestamps"], stats["request_success"]) if ts > period_start]
+    period_requests = [(ts, success) for ts, success in zip(stats_data["request_timestamps"], stats_data["request_success"]) if ts > period_start]
     
     # Calculate stats directly from the period data
     total_requests = len(period_requests)
     successful_requests = sum(1 for _, success in period_requests if success)
     
     # Get response times for this period for calculating average response time
-    period_response_times = [rt for rt, ts in zip(stats["response_times"], stats["request_timestamps"]) if ts > period_start]
+    period_response_times = [rt for rt, ts in zip(stats_data["response_times"], stats_data["request_timestamps"]) if ts > period_start]
     
     # Calculate requests per minute based on first request time
     if total_requests > 0:
@@ -715,6 +649,12 @@ def get_avg_response_time(model_name):
     
     return sum(response_times) / len(response_times)
 
+def update_last_request_time(model_name):
+    """Update the last request time for a specific model."""
+    with model_lock:
+        model_last_request[model_name] = time.time()
+        logger.debug(f"Updated last request time for {model_name}")
+
 @app.route('/dashboard', methods=['GET'])
 def dashboard():
     """Combined dashboard showing all models in a single table."""
@@ -723,51 +663,75 @@ def dashboard():
         all_models = {}
         
         # First, collect all available models
+        model_names = list(model_configs.keys())
+        
+        # Get current time for inactivity calculations
+        current_time = time.time()
+        
+        # Get all model stats in one lock acquisition
         with model_stats_lock:
-            for model_name, model_config in model_configs.items():
+            for model_name in model_names:
                 if model_name not in model_stats:
                     init_model_stats(model_name)
                 
-                # Force check model availability if last check was more than 5 seconds ago
+                # Get stats object without checking availability yet
                 stats = model_stats[model_name]
-                if time.time() - stats["last_check"] > 5:
-                    stats["downloaded"] = is_ollama_model_available(OLLAMA_PATH, model_name, is_loading_dashboard=True)
-                    stats["last_check"] = time.time()
                 
                 all_models[model_name] = {
                     "name": model_name,
-                    "other_names": model_config.get('other_names', []),
+                    "other_names": model_configs[model_name].get('other_names', []),
                     "downloaded": stats["downloaded"],
-                    "container_name": model_config["container_name"],
+                    "container_name": model_configs[model_name]["container_name"],
                     "is_running": False,
                     "port": "N/A",
                     "device_id": "N/A",
-                    "total_requests": 0,
-                    "successful_requests": 0,
-                    "requests_per_minute": 0,
-                    "avg_response_time": 0
+                    "total_requests": stats["total_requests"],
+                    "successful_requests": stats["successful_requests"],
+                    "response_times": list(stats["response_times"]),
+                    "request_timestamps": list(stats["request_timestamps"]),
+                    "request_success": list(stats["request_success"]),
+                    "last_check": stats["last_check"],
+                    "last_request_time": model_last_request.get(model_name, 0)
                 }
+        
+        # Now update availability info separately to avoid lock nesting
+        for model_name, model_data in all_models.items():
+            # Force check model availability if last check was more than 5 seconds ago
+            if time.time() - model_data["last_check"] > 5:
+                is_available = is_ollama_model_available(OLLAMA_PATH, model_name, is_loading_dashboard=True)
+                
+                # Update the stats with the new availability info
+                with model_stats_lock:
+                    if model_name in model_stats:
+                        model_stats[model_name]["downloaded"] = is_available
+                        model_stats[model_name]["last_check"] = time.time()
+                
+                model_data["downloaded"] = is_available
         
         # Then check which models are running and update their info
         for model_name, model_config in model_configs.items():
             container_name = model_config["container_name"]
             
             try:
-                # Check if container is running with a timeout
-                is_running = is_container_running(model_configs[model_name]["port"], container_name)
+                # Check container status
+                exists, container_status = get_container_status(container_name, docker_client)
                 
-                if is_running and model_name in all_models:
+                if exists and model_name in all_models:
                     # Get statistics with a timeout
                     with model_stats_lock:
                         if model_name not in model_stats:
                             init_model_stats(model_name)
                         
                         stats = model_stats[model_name]
-                        
+                    
+                    # Update is_running based on container status
+                    is_running = container_status == 'running'
+                    
                     all_models[model_name].update({
-                        "is_running": True,
-                        "port": model_config["port"],
-                        "device_id": model_config["device_id"],
+                        "is_running": is_running,
+                        "container_status": container_status,
+                        "port": model_config["port"] if is_running else "N/A",
+                        "device_id": model_config["device_id"] if is_running else "N/A",
                         "total_requests": stats["total_requests"],
                         "successful_requests": stats["successful_requests"],
                         "requests_per_minute": get_requests_per_minute(model_name),
@@ -783,231 +747,8 @@ def dashboard():
                 "models": list(all_models.values())
             }), 200
         
-        # Generate HTML
-        html = """
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Llama.cpp Scheduler Dashboard</title>
-            <style>
-                body { 
-                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
-                    margin: 20px; 
-                    background-color: #f9f9f9;
-                    color: #333;
-                }
-                h1, h2 { 
-                    color: #2c3e50; 
-                    margin-bottom: 20px;
-                }
-                h1 {
-                    border-bottom: 2px solid #3498db;
-                    padding-bottom: 10px;
-                }
-                .container {
-                    max-width: 1400px;
-                    margin: 0 auto;
-                    padding: 20px;
-                    background-color: white;
-                    border-radius: 8px;
-                    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-                }
-                table { 
-                    border-collapse: collapse; 
-                    width: 100%; 
-                    margin-top: 20px; 
-                    margin-bottom: 40px;
-                    font-size: 14px;
-                }
-                th, td { 
-                    padding: 12px 15px; 
-                    text-align: left; 
-                    border-bottom: 1px solid #e1e1e1; 
-                }
-                th { 
-                    background-color: #3498db; 
-                    color: white; 
-                    font-weight: bold;
-                    position: sticky;
-                    top: 0;
-                }
-                tr:nth-child(even) { background-color: #f7f7f7; }
-                tr:hover { background-color: #f1f1f1; }
-                .model-name {
-                    font-weight: bold;
-                    font-size: 15px;
-                }
-                .other-names { 
-                    color: #666; 
-                    font-size: 0.9em;
-                    font-style: italic;
-                    display: block;
-                    margin-top: 4px;
-                }
-                .running {
-                    background-color: #e8f5e9;
-                }
-                .status-true { 
-                    color: #2ecc71; 
-                    font-weight: bold; 
-                }
-                .status-false { 
-                    color: #e74c3c; 
-                }
-                .status-running {
-                    display: inline-block;
-                    padding: 4px 8px;
-                    border-radius: 4px;
-                    background-color: #2ecc71;
-                    color: white;
-                    font-weight: bold;
-                }
-                .status-stopped {
-                    display: inline-block;
-                    padding: 4px 8px;
-                    border-radius: 4px;
-                    background-color: #95a5a6;
-                    color: white;
-                }
-                .success-rate { font-weight: bold; }
-                .high-rate { color: #2ecc71; }
-                .medium-rate { color: #f39c12; }
-                .low-rate { color: #e74c3c; }
-                .refresh-button { 
-                    background-color: #3498db; 
-                    color: white; 
-                    padding: 10px 20px; 
-                    border: none; 
-                    border-radius: 4px; 
-                    cursor: pointer; 
-                    margin-top: 20px;
-                    font-size: 16px;
-                    transition: background-color 0.3s;
-                }
-                .refresh-button:hover { 
-                    background-color: #2980b9; 
-                }
-                .section { 
-                    margin-bottom: 40px; 
-                }
-                .last-update { 
-                    color: #7f8c8d; 
-                    font-size: 0.9em; 
-                    margin: 10px 0 20px 0;
-                }
-                .error-message { 
-                    color: #e74c3c; 
-                    margin: 10px 0; 
-                    padding: 10px;
-                    background-color: #fadbd8;
-                    border-radius: 4px;
-                }
-                .time-period-selector {
-                    margin: 20px 0;
-                }
-                .time-period-selector label {
-                    margin-right: 15px;
-                    font-weight: bold;
-                }
-                .time-period-buttons {
-                    margin-top: 10px;
-                    display: flex;
-                    gap: 10px;
-                }
-                .period-button {
-                    padding: 8px 15px;
-                    border-radius: 4px;
-                    border: 1px solid #3498db;
-                    background-color: #fff;
-                    color: #3498db;
-                    cursor: pointer;
-                    transition: all 0.3s;
-                    font-weight: bold;
-                }
-                .period-button:hover {
-                    background-color: #eaf2f8;
-                }
-                .period-button.active {
-                    background-color: #3498db;
-                    color: white;
-                }
-                .model-row.hidden {
-                    display: none;
-                }
-                .port-gpu-info {
-                    white-space: nowrap;
-                }
-                .port-gpu-label {
-                    font-weight: bold;
-                    color: #7f8c8d;
-                    margin-right: 5px;
-                }
-            </style>
-            <script>
-                function refreshPage() {
-                    location.reload();
-                }
-                
-                // Auto refresh every 30 mins 
-                setTimeout(function() {
-                    refreshPage();
-                }, 1800000);
-                
-                // Change time period
-                function changeTimePeriod(period) {
-                    // Update active button styling
-                    document.querySelectorAll('.period-button').forEach(btn => {
-                        btn.classList.remove('active');
-                    });
-                    document.getElementById(period + '-btn').classList.add('active');
-                    
-                    // Show all rows
-                    document.querySelectorAll('.all-time-row, .past-hour-row, .past-day-row').forEach(row => {
-                        row.classList.add('hidden');
-                    });
-                    
-                    // Show only selected period rows
-                    document.querySelectorAll('.' + period + '-row').forEach(row => {
-                        row.classList.remove('hidden');
-                    });
-                }
-                
-                // Initialize on load
-                window.onload = function() {
-                    // Default to all-time view
-                    changeTimePeriod('all-time');
-                }
-            </script>
-        </head>
-        <body>
-            <div class="container">
-                <h1>Llama.cpp Scheduler Dashboard</h1>
-                <button class="refresh-button" onclick="refreshPage()">Refresh Dashboard</button>
-                <p><small>Page auto-refreshes every 30 minutes</small></p>
-                <p class="last-update">Last updated: """ + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + """</p>
-                
-                <div class="time-period-selector">
-                    <label>Select Time Period:</label>
-                    <div class="time-period-buttons">
-                        <button id="all-time-btn" class="period-button active" onclick="changeTimePeriod('all-time')">All Time</button>
-                        <button id="past-hour-btn" class="period-button" onclick="changeTimePeriod('past-hour')">Past Hour</button>
-                        <button id="past-day-btn" class="period-button" onclick="changeTimePeriod('past-day')">Past Day</button>
-                    </div>
-                </div>
-                
-                <div class="section">
-                    <h2>All Models</h2>
-                    <table>
-                        <tr>
-                            <th>Model</th>
-                            <th>Status</th>
-                            <th>Downloaded</th>
-                            <th>Total Requests</th>
-                            <th>Success Rate</th>
-                            <th>Requests/Min</th>
-                            <th>Avg Response Time</th>
-                        </tr>
-        """
+        # Use template for HTML header
+        html = get_dashboard_header(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         
         # Sort models: running first, then alphabetical
         sorted_models = sorted(all_models.values(), key=lambda x: (not x["is_running"], x["name"]))
@@ -1021,10 +762,43 @@ def dashboard():
             
             # Format downloaded status
             download_status = "Yes" if model["downloaded"] else "No"
-            status_class = "status-true" if model["downloaded"] else "status-false"
+            download_status_class = "status-true" if model["downloaded"] else "status-false"
             
             # Format running status
-            status_display = '<span class="status-running">Running</span>' if model["is_running"] else '<span class="status-stopped">Stopped</span>'
+            exists, container_status = get_container_status(model["container_name"], docker_client)
+            if exists:
+                if container_status == 'running':
+                    # Calculate time until unload
+                    with model_lock:
+                        last_request_time = model_last_request.get(model["name"], current_time)
+                    
+                    time_since_last_request = current_time - last_request_time
+                    time_until_unload = max(0, INACTIVITY_TIMEOUT - time_since_last_request)
+                    
+                    # Format time until unload
+                    if time_until_unload > 0:
+                        minutes, seconds = divmod(int(time_until_unload), 60)
+                        hours, minutes = divmod(minutes, 60)
+                        
+                        if hours > 0:
+                            time_format = f"{hours}h {minutes}m"
+                        else:
+                            time_format = f"{minutes}m {seconds}s"
+                    else:
+                        time_format = "unloading soon..."
+                    
+                    # Add the unload timer on a new line between Running and port info
+                    status_display = f'<span class="status-running">Running</span><br><span class="unload-timer">{time_format}</span>'
+                    status_class = "status-running"
+                else:
+                    status_class = f"status-{container_status}" if container_status in ['exited', 'created', 'restarting', 'paused'] else "status-stopped"
+                    status_display = f'<span class="{status_class}">{container_status.capitalize()}</span>'
+            else:
+                status_display = '<span class="status-stopped">Stopped</span>'
+                status_class = "status-stopped"
+            
+            # Update is_running for statistics
+            model["is_running"] = exists and container_status == 'running'
             
             # Format port and GPU info
             if model["is_running"]:
@@ -1033,9 +807,9 @@ def dashboard():
                 port_gpu_info = "N/A"
             
             # Get stats for different periods
-            all_time = get_stats_for_period(model["name"], float('inf'))
-            past_hour = get_stats_for_period(model["name"], 3600)
-            past_day = get_stats_for_period(model["name"], 86400)
+            all_time = get_stats_for_period(model["name"], float('inf'), model_stats[model["name"]])
+            past_hour = get_stats_for_period(model["name"], 3600, model_stats[model["name"]])
+            past_day = get_stats_for_period(model["name"], 86400, model_stats[model["name"]])
             
             # Calculate success rates
             all_time_rate = (all_time[1] / all_time[0] * 100) if all_time[0] > 0 else 0
@@ -1058,7 +832,7 @@ def dashboard():
                 <tr class="model-row all-time-row {row_class}">
                     <td rowspan="1">{model_name_display}</td>
                     <td rowspan="1">{status_display}<br>{port_gpu_info}</td>
-                    <td rowspan="1" class="{status_class}">{download_status}</td>
+                    <td rowspan="1" class="{download_status_class}">{download_status}</td>
                     <td>{all_time[0]}</td>
                     <td class="success-rate {all_time_class}">{all_time_rate:.1f}%</td>
                     <td>{all_time[2]:.1f}</td>
@@ -1067,7 +841,7 @@ def dashboard():
                 <tr class="model-row past-hour-row hidden {row_class}">
                     <td rowspan="1">{model_name_display}</td>
                     <td rowspan="1">{status_display}<br>{port_gpu_info}</td>
-                    <td rowspan="1" class="{status_class}">{download_status}</td>
+                    <td rowspan="1" class="{download_status_class}">{download_status}</td>
                     <td>{past_hour[0]}</td>
                     <td class="success-rate {past_hour_class}">{past_hour_rate:.1f}%</td>
                     <td>{past_hour[2]:.1f}</td>
@@ -1076,7 +850,7 @@ def dashboard():
                 <tr class="model-row past-day-row hidden {row_class}">
                     <td rowspan="1">{model_name_display}</td>
                     <td rowspan="1">{status_display}<br>{port_gpu_info}</td>
-                    <td rowspan="1" class="{status_class}">{download_status}</td>
+                    <td rowspan="1" class="{download_status_class}">{download_status}</td>
                     <td>{past_day[0]}</td>
                     <td class="success-rate {past_day_class}">{past_day_rate:.1f}%</td>
                     <td>{past_day[2]:.1f}</td>
@@ -1084,35 +858,35 @@ def dashboard():
                 </tr>
             """
         
-        html += """
-                    </table>
-                </div>
-            </div>
-        </body>
-        </html>
-        """
+        # Use template for HTML footer
+        html += get_dashboard_footer()
         
         return html
         
     except Exception as e:
         logger.error(f"Error generating dashboard: {str(e)}")
-        return f"""
-        <html>
-        <head>
-            <title>Error - Llama.cpp Scheduler Dashboard</title>
-            <style>
-                body {{ font-family: Arial, sans-serif; margin: 20px; }}
-                .error-message {{ color: red; }}
-            </style>
-        </head>
-        <body>
-            <h1>Error Loading Dashboard</h1>
-            <p class="error-message">An error occurred while generating the dashboard. Please try refreshing the page.</p>
-            <p>Error details: {str(e)}</p>
-            <button onclick="location.reload()">Refresh Page</button>
-        </body>
-        </html>
-        """, 500
+        return get_error_page(str(e)), 500
+
+
+@app.route('/v1/chat/completions', methods=['POST'])
+def handle_chat_completion():
+    """Handle OpenAI chat completions endpoint."""
+    return handle_request(request.json, '/v1/chat/completions', 'chat')
+
+@app.route('/api/chat', methods=['POST'])
+def handle_api_chat():
+    """Handle chat requests to the /api/chat endpoint."""
+    return handle_request(request.json, '/api/chat', 'chat')
+
+@app.route('/v1/embeddings', methods=['POST'])
+def handle_embeddings():
+    """Handle requests to the /v1/embeddings endpoint."""
+    return handle_request(request.json, '/v1/embeddings', 'embedding' )
+
+@app.route('/api/embed', methods=['POST'])
+def handle_api_embed():
+    """Handle requests to the /api/embed endpoint."""
+    return handle_request(request.json, '/api/embed', 'embedding' )
 
 if __name__ == '__main__':
     logger.info("Starting Llama.cpp scheduler")
@@ -1121,15 +895,17 @@ if __name__ == '__main__':
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
-    # Stop all containers when the program starts
-    stop_all_containers()
+    # Stop and remove all containers when the program starts to ensure a clean state
+    logger.info("Stopping and removing all existing containers")
+    stop_all_containers(model_configs, docker_client)
     
     # Start the inactivity monitor in a separate thread
     Thread(target=monitor_inactivity, daemon=True).start()
     
     # Start the Flask app
-    debug = config['debug']
-    host = config['host']
-    port = config['port'] if not debug else config['port'] + 1 # port + 1 for debug
+    if config['debug']:
+        port = find_next_available_port(start_port=config['port'] + 1) # + 1  to avoid conflict with the running port
+    else:
+        port = find_next_available_port(start_port=config['port'])
     
-    app.run(host=host, port=port, debug=debug)
+    app.run(host=config['host'], port=port, debug=config['debug'])

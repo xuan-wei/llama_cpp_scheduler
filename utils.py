@@ -6,7 +6,6 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import logging
-import requests
 
 def setup_logger(name):
     """Configure and return a logger instance."""
@@ -17,6 +16,7 @@ def setup_logger(name):
     return logging.getLogger(name) 
 
 logger = setup_logger('scheduler_utils')
+
 
 def get_best_gpu(force_gpu_id=None):
     """
@@ -281,23 +281,14 @@ def ensure_models_exist(models_config, model_base_path):
         return False
     return True
 
-def is_container_running(port, container_name):
-    """Check if a container is running and ready to accept requests using Docker SDK."""
+def is_container_running(container_name, docker_client):
+    """Check if a container is running using Docker SDK."""
     try:
-
-        # Try to connect to the health check endpoint
-        try:
-            response = requests.get(f'http://localhost:{port}/health', timeout=2)
-            return response.status_code == 200
-        except requests.exceptions.RequestException as e:
-            logger.debug(f"Container {container_name} is not ready yet: {str(e)}")
-            return False
-            
+        # Only get running containers
+        containers = docker_client.containers.list(filters={"name": container_name}, all=False)
+        return len(containers) > 0
     except docker.errors.APIError as e:
         logger.error(f"Error checking if container {container_name} is running: {str(e)}")
-        return False
-    except Exception as e:
-        logger.error(f"Unexpected error checking container {container_name}: {str(e)}")
         return False
 
 def get_container(container_name, docker_client, all=True):
@@ -307,4 +298,88 @@ def get_container(container_name, docker_client, all=True):
         return containers[0] if containers else None
     except docker.errors.APIError as e:
         logger.error(f"Error getting container {container_name}: {str(e)}")
-        return None 
+        return None
+
+def get_container_status(container_name, docker_client):
+    """
+    Get detailed status of a container by name.
+    Returns a tuple: (exists, status_string)
+    Where status_string is one of: 'running', 'exited', 'created', 'paused', 'restarting', etc.
+    """
+    try:
+        container = get_container(container_name, docker_client, all=True)
+        if container:
+            return True, container.status
+        return False, None
+    except docker.errors.APIError as e:
+        logger.error(f"Error getting status for container {container_name}: {str(e)}")
+        return False, None
+
+def stop_container(container_name, docker_client, remove=False):
+    """
+    Stop a container if it exists and is running or in another active state.
+    Optionally remove the container after stopping.
+    Returns True if operation was successful or if container doesn't exist.
+    """
+    try:
+        container = get_container(container_name, docker_client, all=True)
+        
+        if not container:
+            logger.info(f"Container {container_name} does not exist")
+            return True
+            
+        exists, status = get_container_status(container_name, docker_client)
+        
+        if exists:
+            if status == 'running' or status in ['restarting', 'paused']:
+                logger.info(f"Stopping container {container_name} (current status: {status})")
+                container.stop(timeout=30)
+                logger.info(f"Container {container_name} stopped")
+            else:
+                logger.info(f"Container {container_name} is already stopped (status: {status})")
+                
+            if remove:
+                logger.info(f"Removing container {container_name}")
+                container.remove(force=True)
+                logger.info(f"Container {container_name} removed")
+                
+        return True
+    except docker.errors.APIError as e:
+        logger.error(f"Error stopping/removing container {container_name}: {str(e)}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error with container {container_name}: {str(e)}")
+        return False
+
+def remove_container_if_exists(container_name, docker_client):
+    """
+    Remove a container if it exists, regardless of its status.
+    Returns True if successful or if container doesn't exist.
+    """
+    try:
+        container = get_container(container_name, docker_client, all=True)
+        
+        if not container:
+            logger.info(f"Container {container_name} does not exist, nothing to remove")
+            return True
+            
+        # Force remove handles any container state
+        logger.info(f"Removing container {container_name} (status: {container.status})")
+        container.remove(force=True)
+        logger.info(f"Container {container_name} successfully removed")
+        return True
+    except docker.errors.APIError as e:
+        logger.error(f"Error removing container {container_name}: {str(e)}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error removing container {container_name}: {str(e)}")
+        return False 
+    
+def process_chunk(chunk):
+    """Process a chunk of data."""
+    # Example processing: decode the chunk
+    try:
+        return chunk.decode('utf-8')
+    except UnicodeDecodeError:
+        return chunk  # Return raw chunk if decoding fails
+    
