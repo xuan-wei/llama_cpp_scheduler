@@ -146,9 +146,6 @@ def start_container(model_name, model_configs, docker_client, docker_image,
             command.extend(["--cont-batching"])
         if config.get("flash_attn", False):
             command.extend(["--flash-attn"])
-        
-        command.extend(["--ctx-size", str(config["ctx_size"])])
-        command.extend(["--parallel", str(config["parallel"])])
 
         if service_type == 'chat':          
             command.extend(["--predict", str(config["predict"])])

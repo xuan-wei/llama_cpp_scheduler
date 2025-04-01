@@ -580,20 +580,22 @@ def get_stats_for_period(model_name, period_seconds, stats_data):
     period_requests = [(ts, success) for ts, success in zip(stats_data["request_timestamps"], stats_data["request_success"]) if ts > period_start]
     
     # Calculate stats directly from the period data
-    total_requests = len(period_requests)
-    successful_requests = sum(1 for _, success in period_requests if success)
+    total_requests = stats_data["total_requests"]
+    successful_requests = stats_data["successful_requests"]
+
+    requests_in_period = len(period_requests)
     
     # Get response times for this period for calculating average response time
     period_response_times = [rt for rt, ts in zip(stats_data["response_times"], stats_data["request_timestamps"]) if ts > period_start]
     
     # Calculate requests per minute based on first request time
-    if total_requests > 0:
+    if requests_in_period > 0:
         # Find the timestamp of the first request in this period
         first_request_time = min(ts for ts, _ in period_requests) if period_requests else now
         actual_period_duration = now - first_request_time
         # Use at least 1 second to avoid division by zero
         actual_period_duration = max(actual_period_duration, 1)
-        requests_per_minute = (total_requests / actual_period_duration) * 60
+        requests_per_minute = (requests_in_period / actual_period_duration) * 60
     else:
         requests_per_minute = 0
     

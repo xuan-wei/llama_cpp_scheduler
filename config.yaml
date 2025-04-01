@@ -92,6 +92,13 @@ models:
     cont_batching: 1
     other_names: ["deepseek-r1-8b"]
 
+  deepseek-r1:14b:
+    ctx_size: 81920
+    parallel: 10
+    flash_attn: 1
+    cont_batching: 1
+    other_names: ["deepseek-r1-14b"]
+
   glm4:
     ctx_size: 40960
     parallel: 10
