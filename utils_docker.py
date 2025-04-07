@@ -159,6 +159,8 @@ def start_container(model_name, model_configs, docker_client, docker_image,
             command.extend(["--embedding",
                             "--batch-size", str(config["model_ctx_size"]),
                             "--ubatch-size", str(config["model_ctx_size"])])
+            command.extend(["--ctx-size", str(config["ctx_size"])])
+            command.extend(["--parallel", str(config["parallel"])])
             if config.get("rope_scaling"):
                 command.extend(["--rope-scaling", config["rope_scaling"]])
             if config.get("rope_freq_scale"):

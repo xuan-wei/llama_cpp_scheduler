@@ -37,8 +37,8 @@ common_config:
 # If you want to specify some other names, you can add other_names: ["other_name1", "other_name2"]. Then you can also use other_name1 or other_name2 to start the model.
 models:
   qwen2.5:14b: 
-    ctx_size: 40960
-    parallel: 10
+    ctx_size: 81920
+    parallel: 20
     flash_attn: 1
     cont_batching: 1
     other_names: ["qwen2.5-14b"]
@@ -58,8 +58,8 @@ models:
     other_names: ["phi4-14b"]
 
   qwen2.5:7b:
-    ctx_size: 40960
-    parallel: 10
+    ctx_size: 81920
+    parallel: 20
     flash_attn: 1
     cont_batching: 1
     other_names: ["qwen2.5-7b"]
@@ -79,8 +79,8 @@ models:
     other_names: ["deepseek-coder-6.7b"]
 
   deepseek-r1:7b: # deepseek-r1-distill-qwen
-    ctx_size: 40960
-    parallel: 10
+    ctx_size: 81920
+    parallel: 20
     flash_attn: 1
     cont_batching: 1
     other_names: ["deepseek-r1-7b"]
@@ -94,7 +94,7 @@ models:
 
   deepseek-r1:14b:
     ctx_size: 81920
-    parallel: 10
+    parallel: 20
     flash_attn: 1
     cont_batching: 1
     other_names: ["deepseek-r1-14b"]
@@ -129,8 +129,8 @@ models:
     parallel: 1 # no need to parallel for embedding model, the increase is minimal
     flash_attn: 0 # no need for embedding model
     cont_batching: 0 # no need for embedding model
-    # rope_scaling: "yarn" # not sure, do not remove it yet
-    # rope_freq_scale: "0.25" # not sure, do not remove it yet
+    rope_scaling: "yarn" 
+    rope_freq_scale: "0.75" 
     other_names: ["nomic-embed-text"]
 
 # Add this to your existing config.yaml
