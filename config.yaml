@@ -32,22 +32,46 @@ common_config:
   predict: 2048 # default predict length
 
 # Model specific configurations
-# Use the Ollama model format: [namespace/]name[:tag] -- default tag is latest
-# For example: qwen2.5:14b, llama3:8b.
-# If you want to specify some other names, you can add other_names: ["other_name1", "other_name2"]. Then you can also use other_name1 or other_name2 to start the model.
+  # Example
+  # qwen2.5:14b-long-context:  # custom name for qwen2.5:14b
+  #   ctx_size: 65536
+  #   parallel: 8
+  #   flash_attn: 1
+  #   cont_batching: 1
+  #   ollama_name: "qwen2.5:14b" # ollama model name, [namespace/]name[:tag] -- default tag is latest
+  #   other_names: ["qwen2.5:14b-long-context", "qwen2.5-14b-long-context"] # other names for the model
+
 models:
   qwen2.5:14b: 
     ctx_size: 81920
     parallel: 20
     flash_attn: 1
     cont_batching: 1
-    other_names: ["qwen2.5-14b"]
+    ollama_name: "qwen2.5:14b"
+    other_names: ["qwen2.5-14b-short-context", "qwen2.5-14b", "qwen2.5:14b"]
+  
+  qwen2.5:14b-long-context: 
+    ctx_size: 65536
+    parallel: 8
+    flash_attn: 1
+    cont_batching: 1
+    ollama_name: "qwen2.5:14b" 
+    other_names: ["qwen2.5:14b-long-context", "qwen2.5-14b-long-context"]
+
+  qwen2.5:0.5b:
+    ctx_size: 81920
+    parallel: 20
+    flash_attn: 1
+    cont_batching: 1
+    ollama_name: "qwen2.5:0.5b"
+    other_names: ["qwen2.5-0.5b"]
   
   rouge/nanbeige2-16b-chat:
     ctx_size: 40960
     parallel: 10
     flash_attn: 1
     cont_batching: 1
+    ollama_name: "rouge/nanbeige2-16b-chat"
     other_names: ["nanbeige-16b", "nanbeige2-16b-chat"]
 
   phi4:14b:
@@ -55,6 +79,7 @@ models:
     parallel: 10
     flash_attn: 1
     cont_batching: 1
+    ollama_name: "phi4:14b"
     other_names: ["phi4-14b"]
 
   qwen2.5:7b:
@@ -62,6 +87,7 @@ models:
     parallel: 20
     flash_attn: 1
     cont_batching: 1
+    ollama_name: "qwen2.5:7b"
     other_names: ["qwen2.5-7b"]
 
   qwen2.5-coder:7b:
@@ -69,6 +95,7 @@ models:
     parallel: 10
     flash_attn: 1
     cont_batching: 1
+    ollama_name: "qwen2.5-coder:7b"
     other_names: ["qwen2.5-coder-7b"]
 
   deepseek-coder:6.7b:
@@ -76,6 +103,7 @@ models:
     parallel: 10
     flash_attn: 1
     cont_batching: 1
+    ollama_name: "deepseek-coder:6.7b"
     other_names: ["deepseek-coder-6.7b"]
 
   deepseek-r1:7b: # deepseek-r1-distill-qwen
@@ -83,6 +111,7 @@ models:
     parallel: 20
     flash_attn: 1
     cont_batching: 1
+    ollama_name: "deepseek-r1:7b"
     other_names: ["deepseek-r1-7b"]
   
   deepseek-r1:8b: # deepseek-r1-distill-Llama
@@ -90,6 +119,7 @@ models:
     parallel: 10
     flash_attn: 1
     cont_batching: 1
+    ollama_name: "deepseek-r1:8b"
     other_names: ["deepseek-r1-8b"]
 
   deepseek-r1:14b:
@@ -97,20 +127,31 @@ models:
     parallel: 20
     flash_attn: 1
     cont_batching: 1
+    ollama_name: "deepseek-r1:14b"
     other_names: ["deepseek-r1-14b"]
+
+  deepseek-r1:14b-long-context:
+    ctx_size: 65536
+    parallel: 8
+    flash_attn: 1
+    cont_batching: 1
+    ollama_name: "deepseek-r1:14b"
+    other_names: ["deepseek-r1:14b-long-context", "deepseek-r1-14b-long-context"]
 
   glm4:
     ctx_size: 40960
     parallel: 10
     flash_attn: 1
     cont_batching: 1
+    ollama_name: "glm4"
     other_names: ["glm4"]
 
   llama3.1:8b:
     ctx_size: 40960
-    parallel: 10
+    parallel: 10  
     flash_attn: 1
     cont_batching: 1
+    ollama_name: "llama3.1:8b"
     other_names: ["llama3.1-8b"]
 
   all-minilm:l6-v2:
@@ -120,6 +161,7 @@ models:
     parallel: 1 # no need to parallel for embedding model, the increase is minimal
     flash_attn: 0 # no need for embedding model
     cont_batching: 0 # no need for embedding model
+    ollama_name: "all-minilm:l6-v2"
     other_names: ["all-minilm"]
 
   nomic-embed-text:v1.5:
@@ -131,6 +173,7 @@ models:
     cont_batching: 0 # no need for embedding model
     rope_scaling: "yarn" 
     rope_freq_scale: "0.75" 
+    ollama_name: "nomic-embed-text:v1.5"
     other_names: ["nomic-embed-text"]
 
 # Add this to your existing config.yaml

@@ -108,6 +108,9 @@ def start_container(model_name, model_configs, docker_client, docker_image,
     config = model_configs[model_name]
     container_name = config["container_name"]
     
+    # Get the ollama model name for logging
+    ollama_model_name = config.get("ollama_name", model_name)
+    
     try:
         # Check if container is already running
         if is_container_running(container_name, docker_client):
@@ -179,7 +182,7 @@ def start_container(model_name, model_configs, docker_client, docker_image,
             logger.info(f"Adjusted model path: {command[1]}")
         
         # Log the full command for debugging
-        logger.info(f"Starting container {container_name} on device {config['device_id']} with command: {' '.join(command)}")
+        logger.info(f"Starting container {container_name} for model {ollama_model_name} on device {config['device_id']} with command: {' '.join(command)}")
         
         # Create and start the container
         container = docker_client.containers.run(
@@ -193,14 +196,14 @@ def start_container(model_name, model_configs, docker_client, docker_image,
             runtime="nvidia"  # Remove if not using NVIDIA GPU
         )
         
-        logger.info(f"Container {container_name} started with ID: {container.id}")
+        logger.info(f"Container {container_name} for model {ollama_model_name} started with ID: {container.id}")
         return True
         
     except docker.errors.APIError as e:
-        logger.error(f"Error starting container {container_name}: {str(e)}")
+        logger.error(f"Error starting container {container_name} for model {ollama_model_name}: {str(e)}")
         return False
     except Exception as e:
-        logger.error(f"Unexpected error starting container {container_name}: {str(e)}")
+        logger.error(f"Unexpected error starting container {container_name} for model {ollama_model_name}: {str(e)}")
         return False
 
 def wait_for_container_ready(model_name, model_configs, docker_client, timeout=60, health_check_interval=2):

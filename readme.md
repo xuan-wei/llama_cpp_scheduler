@@ -39,11 +39,16 @@ While Ollama provides a user-friendly interface for running LLMs, I met a signif
    ```
 
 3. Configure your models in `config.yaml`. Several key points:
-   - Set `debug` to `true` when debugging (debug port: 5001). When `debug=false`, the port is 5000
+   - Set `debug` to `true` when debugging.
    - Set the path to your Ollama models repository (necessary if you want to re-use Ollama models)
    - Set the HF_path to your HuggingFace cache path (necessary if you want to re-use locally downloaded models from HuggingFace)
    - Set model-specific parameters
-     - **Naming**: Use the Ollama model format: `[namespace/]name[:tag]` (e.g., `qwen2.5:14b`, `llama3:8b`)
+
+     - **Multiple Instances**: You can run multiple instances of the same model with different configurations by:
+       - Using different service names (e.g., `qwen2.5:14b`, `qwen2.5:14b-long-context`)
+       - Setting `ollama_name` to the base model name (e.g., `"ollama_name": "qwen2.5:14b"`)
+       - Configuring different resource allocations (e.g., vary `parallel`, `ctx_size`)
+       - Adding custom `other_names` for convenient access
      - **Embedding**: Set `model_ctx_size` properly to match the tokenizer's context window. Need to check the official docs of the model you are using (`important and necessary`); Or, the truncation won't work and it will raise error. Note: Embedding models don't benefit much from `parallel`, `flash_attn`, or `cont_batching` settings. Set `parallel` to 1 and turn off `flash_attn` and `cont_batching`.
 
 

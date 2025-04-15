@@ -240,36 +240,58 @@ def get_model_container_ready(model_name, service_type, start_time):
             logger.error("Ollama path is not configured")
             update_model_stats(model_name, time.time() - start_time, success=False)
             return False
+        
+        # Get ollama_name from config if available, otherwise use model_name
+        ollama_model_name = model_configs[model_name].get("ollama_name", model_name)
             
         if not check_model_availability(model_name, is_loading_dashboard=False):
-            logger.info(f"Model {model_name} not found in Ollama repository, attempting to download")
+            logger.info(f"Model {ollama_model_name} not found in Ollama repository, attempting to download")
             try:
                 # Use ollama pull to download the model
-                logger.info(f"Pulling model {model_name} using ollama pull")
-                result = subprocess.run(['ollama', 'pull', model_name], 
-                                    capture_output=True, 
-                                    text=True, 
-                                    check=True)
-                logger.info(f"Successfully pulled model {model_name}")
+                logger.info(f"Pulling model {ollama_model_name} using ollama pull")
+                # Start the process with stdout and stderr pipes to capture output in real-time
+                process = subprocess.Popen(['ollama', 'pull', ollama_model_name], 
+                                        stdout=subprocess.PIPE, 
+                                        stderr=subprocess.STDOUT,  # Redirect stderr to stdout
+                                        text=True, 
+                                        bufsize=1,
+                                        universal_newlines=True)
+                
+                # Process output in real-time to show download progress
+                for line in iter(process.stdout.readline, ''):
+                    logger.info(f"Ollama pull progress: {line.strip()}")
+                    if not line:
+                        break
+                
+                # Wait for the process to complete
+                return_code = process.wait()
+                
+                # Check if the process was successful
+                if return_code != 0:
+                    stderr_output = process.stdout.read()  # Get any remaining output
+                    raise subprocess.CalledProcessError(return_code, ['ollama', 'pull', ollama_model_name], stderr=stderr_output)
+                logger.info(f"Successfully pulled model {ollama_model_name}")
             except subprocess.CalledProcessError as e:
-                logger.error(f"Failed to pull model {model_name}: {e.stderr}")
+                logger.error(f"Failed to pull model {ollama_model_name}: {e.stderr}")
                 update_model_stats(model_name, time.time() - start_time, success=False)
                 return False
             except Exception as e:
-                logger.error(f"Unexpected error pulling model {model_name}: {str(e)}")
+                logger.error(f"Unexpected error pulling model {ollama_model_name}: {str(e)}")
                 update_model_stats(model_name, time.time() - start_time, success=False)
                 return False
             
             # Check if the model is now available
             if not check_model_availability(model_name, is_loading_dashboard=False):
-                logger.error(f"Model {model_name} still not available after pull attempt")
+                logger.error(f"Model {ollama_model_name} still not available after pull attempt")
                 update_model_stats(model_name, time.time() - start_time, success=False)
                 return False
             
-            logger.info(f"Successfully downloaded model {model_name}")
+            logger.info(f"Successfully downloaded model {ollama_model_name}")
         
-        model_file_path = find_ollama_model_file(OLLAMA_PATH, model_name)
-        logger.info(f"Found model {model_name} in Ollama repository at {model_file_path}")
+        # Get ollama_name from config if available, otherwise use model_name
+        ollama_model_name = model_configs[model_name].get("ollama_name", model_name)
+        model_file_path = find_ollama_model_file(OLLAMA_PATH, ollama_model_name)
+        logger.info(f"Found model {ollama_model_name} in Ollama repository at {model_file_path}")
         
         logger.info(f"Starting container for {model_name}")
         is_success = start_model_container(model_name, service_type, model_file_path)
@@ -551,12 +573,18 @@ def signal_handler(sig, frame):
 
 def check_model_availability(model_name, is_loading_dashboard=False):
     """Check if a model is available in Ollama repository."""
+    # Use ollama_name from config if available
+    if model_name in model_configs and "ollama_name" in model_configs[model_name]:
+        ollama_model_name = model_configs[model_name]["ollama_name"]
+        return is_ollama_model_available(OLLAMA_PATH, ollama_model_name, is_loading_dashboard)
     return is_ollama_model_available(OLLAMA_PATH, model_name, is_loading_dashboard)
 
 def init_model_stats(model_name):
     """Initialize statistics tracking for a model."""
     if model_name not in model_stats:
-        is_downloaded = is_ollama_model_available(OLLAMA_PATH, model_name)
+        # Get ollama_name from config if available
+        ollama_model_name = model_configs[model_name].get("ollama_name", model_name) if model_name in model_configs else model_name
+        is_downloaded = is_ollama_model_available(OLLAMA_PATH, ollama_model_name)
         model_stats[model_name] = {
             "total_requests": 0,
             "successful_requests": 0,
@@ -621,8 +649,11 @@ def update_model_stats(model_name, response_time, success=True):
         stats["request_timestamps"].append(current_time)
         stats["request_success"].append(success)
         
+        # Get ollama_name from config if available
+        ollama_model_name = model_configs[model_name].get("ollama_name", model_name) if model_name in model_configs else model_name
+        
         # Update downloaded status and timestamp
-        stats["downloaded"] = is_ollama_model_available(OLLAMA_PATH, model_name)
+        stats["downloaded"] = is_ollama_model_available(OLLAMA_PATH, ollama_model_name)
         stats["last_check"] = current_time
 
 def get_requests_per_minute(model_name):
@@ -700,7 +731,9 @@ def dashboard():
         for model_name, model_data in all_models.items():
             # Force check model availability if last check was more than 5 seconds ago
             if time.time() - model_data["last_check"] > 5:
-                is_available = is_ollama_model_available(OLLAMA_PATH, model_name, is_loading_dashboard=True)
+                # Get ollama_name from config if available
+                ollama_model_name = model_configs[model_name].get("ollama_name", model_name) if model_name in model_configs else model_name
+                is_available = is_ollama_model_available(OLLAMA_PATH, ollama_model_name, is_loading_dashboard=True)
                 
                 # Update the stats with the new availability info
                 with model_stats_lock:
@@ -905,9 +938,4 @@ if __name__ == '__main__':
     Thread(target=monitor_inactivity, daemon=True).start()
     
     # Start the Flask app
-    if config['debug']:
-        port = find_next_available_port(start_port=config['port'] + 1) # + 1  to avoid conflict with the running port
-    else:
-        port = find_next_available_port(start_port=config['port'])
-    
-    app.run(host=config['host'], port=port, debug=config['debug'])
+    app.run(host=config['host'], port=find_next_available_port(start_port=config['port']), debug=config['debug'])
