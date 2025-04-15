@@ -378,18 +378,22 @@ def handle_request(data, endpoint, service_type):
     """Generalized logic for handling requests."""
     start_time = time.time()
     logger.info(f"Received request from IP: {request.remote_addr} - {endpoint}")
-    
+
     if not data:
         return jsonify({"error": "No JSON data provided"}), 400
         
     model_name = data.get('model')
     if not model_name:
         return jsonify({"error": "Model name not specified"}), 400
-    
+
     # Check if the model name is an alternative name and map it to the primary name
     if model_name in model_name_mapping:
         logger.debug(f"Mapping alternative model name '{model_name}' to primary name '{model_name_mapping[model_name]}'")
         model_name = model_name_mapping[model_name]
+
+    # Update last request time
+    # Update immediately to avoid race condition.
+    update_last_request_time(model_name)
     
     if model_name not in model_configs:
         return jsonify({"error": f"Model {model_name} not in configuration"}), 404
@@ -406,9 +410,6 @@ def handle_request(data, endpoint, service_type):
         # Prepare the container for this model
         if not get_model_container_ready(model_name, service_type, start_time):
             return jsonify({"error": f"Failed to prepare container for {model_name}"}), 500
-            
-    # Update last request time
-    update_last_request_time(model_name)
     
     # Determine endpoint to forward request to
     url_to_forward = 'v1/chat/completions' if service_type == 'chat' else 'v1/embeddings' if service_type == 'embedding' else None

@@ -75,8 +75,8 @@ models:
     other_names: ["nanbeige-16b", "nanbeige2-16b-chat"]
 
   phi4:14b:
-    ctx_size: 40960
-    parallel: 10
+    ctx_size: 81920
+    parallel: 20
     flash_attn: 1
     cont_batching: 1
     ollama_name: "phi4:14b"
